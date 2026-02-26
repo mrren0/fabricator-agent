@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 import tomllib
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -30,15 +31,18 @@ def _env(name: str, default: str | None = None) -> str | None:
 
 class AgentRuntime:
     def __init__(self) -> None:
-        self.backend_url = (_env("AGENT_BACKEND_URL", "http://127.0.0.1:8000") or "").rstrip("/")
+        self.backend_url = (_env("AGENT_BACKEND_URL", "https://api.thun-der.ru") or "").rstrip("/")
         self.api_token = _env("AGENT_API_TOKEN") or _env("SS14_API_TOKEN")
         self.agent_token = _env("AGENT_TOKEN")
-        self.agent_id = _env("AGENT_ID", socket.gethostname()) or socket.gethostname()
+        self.agent_id_file = Path(_env("AGENT_ID_FILE", "/opt/fabricator-agent/agent.id") or "/opt/fabricator-agent/agent.id")
+        self.agent_id = self._resolve_agent_id()
         self.hostname = socket.gethostname()
         self.location = _env("AGENT_LOCATION")
-        self.config_path = Path(_env("AGENT_CONFIG_PATH", "./config.toml") or "./config.toml")
+        self.config_path = Path(
+            _env("AGENT_CONFIG_PATH", "/etc/fabricator-agent/config.toml") or "/etc/fabricator-agent/config.toml"
+        )
         self.public_key = _env("AGENT_PUBLIC_KEY")
-        self.token_file = Path(_env("AGENT_TOKEN_FILE", "./agent.token") or "./agent.token")
+        self.token_file = Path(_env("AGENT_TOKEN_FILE", "/opt/fabricator-agent/agent.token") or "/opt/fabricator-agent/agent.token")
         self.poll_seconds = int(_env("AGENT_POLL_SECONDS", "10") or "10")
         self.timeout = int(_env("AGENT_HTTP_TIMEOUT_SECONDS", "10") or "10")
         self._stop = threading.Event()
@@ -55,6 +59,25 @@ class AgentRuntime:
             "paired": False,
         }
         self._load_token_file()
+
+    def _resolve_agent_id(self) -> str:
+        env_id = _env("AGENT_ID")
+        if env_id:
+            return env_id
+        try:
+            existing = self.agent_id_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+        except Exception:
+            pass
+        generated = f"fbr-{uuid.uuid4().hex[:16]}"
+        try:
+            self.agent_id_file.parent.mkdir(parents=True, exist_ok=True)
+            self.agent_id_file.write_text(generated, encoding="utf-8")
+        except Exception:
+            # Best effort. If file write fails, keep generated value in memory.
+            pass
+        return generated
 
     def _headers(self) -> dict[str, str]:
         return {

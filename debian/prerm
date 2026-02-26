@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ]; then
+  systemctl disable --now fabricator-agent.service >/dev/null 2>&1 || true
+  systemctl daemon-reload || true
+fi
+
+exit 0

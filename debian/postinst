@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ] || [ "$1" = "reconfigure" ]; then
+  mkdir -p /opt/fabricator-agent /etc/fabricator-agent
+
+  if [ ! -f /etc/fabricator-agent/config.toml ]; then
+    cat > /etc/fabricator-agent/config.toml <<'EOF'
+# Optional local agent config
+EOF
+    chmod 640 /etc/fabricator-agent/config.toml || true
+  fi
+
+  python3 -m venv /opt/fabricator-agent/.venv
+  /opt/fabricator-agent/.venv/bin/pip install --upgrade pip >/dev/null
+  /opt/fabricator-agent/.venv/bin/pip install -r /opt/fabricator-agent/requirements.txt >/dev/null
+
+  systemctl daemon-reload || true
+  systemctl enable --now fabricator-agent.service || true
+fi
+
+exit 0

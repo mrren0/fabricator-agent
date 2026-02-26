@@ -2,19 +2,28 @@
 
 Minimal remote agent used by Fabricator core.
 
-## Run locally
+## Install (Debian/Ubuntu)
 
 ```bash
-pip install -r fabricator-agent/requirements.txt
-cd fabricator-agent
-uvicorn agent_main:app --host 0.0.0.0 --port 8010
+apt install fabricator-agent
 ```
 
-## Required env
+Package installs and enables `fabricator-agent.service` automatically.
 
-- `AGENT_BACKEND_URL`
+## Defaults (no manual config required)
+
+- `AGENT_BACKEND_URL=https://api.thun-der.ru`
+- `AGENT_CONFIG_PATH=/etc/fabricator-agent/config.toml`
+- `AGENT_TOKEN_FILE=/opt/fabricator-agent/agent.token`
+- `AGENT_ID` is auto-generated and persisted in `/opt/fabricator-agent/agent.id` if not provided
+
+## Optional env
+
 - `AGENT_ID`
-- `AGENT_CONFIG_PATH`
+- `AGENT_PUBLIC_KEY`
+- `AGENT_POLL_SECONDS`
+- `AGENT_HTTP_TIMEOUT_SECONDS`
+- `AGENT_HTTP_PORT`
 
 ## Pairing flow
 

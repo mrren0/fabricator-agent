@@ -1,0 +1,4 @@
+agent_main.py opt/fabricator-agent/
+requirements.txt opt/fabricator-agent/
+packaging/systemd/fabricator-agent.service lib/systemd/system/
+packaging/systemd/fabricator-agent.env etc/default/

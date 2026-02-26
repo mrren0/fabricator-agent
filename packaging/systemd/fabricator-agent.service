@@ -1,0 +1,15 @@
+[Unit]
+Description=Fabricator Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/fabricator-agent
+EnvironmentFile=-/etc/default/fabricator-agent
+ExecStart=/opt/fabricator-agent/.venv/bin/uvicorn agent_main:app --host 0.0.0.0 --port ${AGENT_HTTP_PORT}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
