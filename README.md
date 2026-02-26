@@ -48,6 +48,7 @@ Package installs and enables `fabricator-agent.service` automatically.
 - `AGENT_POLL_SECONDS`
 - `AGENT_HTTP_TIMEOUT_SECONDS`
 - `AGENT_HTTP_PORT`
+- `AGENT_API_TOKEN` (optional legacy mode; not required for runtime pairing flow)
 
 ## Pairing flow
 
@@ -55,6 +56,8 @@ Package installs and enables `fabricator-agent.service` automatically.
 2. Admin binds this `agent_id` to a `slug` via `/api/agent/admin/pending/{agent_id}/bind`.
 3. Agent calls `/api/agent/enroll/complete` and receives `agent_token`.
 4. Runtime traffic uses `/api/agent/runtime/*` with `X-Agent-Token`.
+
+If runtime token becomes invalid (for example after rebind/reissue), agent clears local token and re-enrolls automatically.
 
 ## Troubleshooting
 

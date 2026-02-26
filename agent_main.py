@@ -18,6 +18,7 @@ from typing import Any
 
 import requests
 from fastapi import FastAPI
+from requests import HTTPError
 
 try:
     import tomllib  # Python 3.11+
@@ -49,6 +50,7 @@ class AgentRuntime:
         self.token_file = Path(_env("AGENT_TOKEN_FILE", "/opt/fabricator-agent/agent.token") or "/opt/fabricator-agent/agent.token")
         self.poll_seconds = int(_env("AGENT_POLL_SECONDS", "10") or "10")
         self.timeout = int(_env("AGENT_HTTP_TIMEOUT_SECONDS", "10") or "10")
+        self._legacy_auth_disabled = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.status: dict[str, Any] = {
@@ -61,6 +63,7 @@ class AgentRuntime:
             "config_sha256": None,
             "claim_code": None,
             "paired": False,
+            "legacy_auth_disabled": False,
         }
         self._load_token_file()
 
@@ -114,6 +117,21 @@ class AgentRuntime:
         except Exception:
             pass
 
+    def _clear_token_file(self) -> None:
+        try:
+            if self.token_file.exists():
+                self.token_file.unlink()
+        except Exception:
+            pass
+
+    def _invalidate_runtime_token(self, reason: str) -> None:
+        # Token can become stale after a rebind/reissue on the backend.
+        self.agent_token = None
+        self.status["paired"] = False
+        self.status["claim_code"] = None
+        self._clear_token_file()
+        self.status["last_error"] = reason
+
     def _read_config(self) -> tuple[dict[str, Any] | None, str | None]:
         if not self.config_path.exists():
             return None, None
@@ -123,6 +141,8 @@ class AgentRuntime:
         return parsed, sha
 
     def _register(self, cfg: dict[str, Any] | None, cfg_sha: str | None) -> None:
+        if not self.api_token or self._legacy_auth_disabled:
+            return
         payload = {
             "agent_id": self.agent_id,
             "hostname": self.hostname,
@@ -139,6 +159,10 @@ class AgentRuntime:
             headers=self._headers(),
             timeout=self.timeout,
         )
+        if res.status_code == 401:
+            self._legacy_auth_disabled = True
+            self.status["legacy_auth_disabled"] = True
+            return
         res.raise_for_status()
         self.status["registered"] = True
         self.status["last_register_at"] = time.time()
@@ -158,13 +182,16 @@ class AgentRuntime:
                 headers=self._runtime_headers(),
                 timeout=self.timeout,
             )
+            if res.status_code == 401:
+                self._invalidate_runtime_token("Runtime token rejected by backend; re-enrolling")
+                return
             res.raise_for_status()
             self.status["last_heartbeat_at"] = time.time()
             self.status["paired"] = True
             return
 
         # Legacy mode: heartbeat is available only with AGENT_API_TOKEN/SS14_API_TOKEN.
-        if not self.api_token:
+        if not self.api_token or self._legacy_auth_disabled:
             return
 
         payload = {
@@ -180,6 +207,11 @@ class AgentRuntime:
             headers=self._headers(),
             timeout=self.timeout,
         )
+        if res.status_code == 401:
+            # Legacy token is optional. Disable this branch and continue runtime pairing.
+            self._legacy_auth_disabled = True
+            self.status["legacy_auth_disabled"] = True
+            return
         res.raise_for_status()
         self.status["last_heartbeat_at"] = time.time()
 
@@ -191,6 +223,9 @@ class AgentRuntime:
                 headers=self._runtime_headers(),
                 timeout=self.timeout,
             )
+            if res.status_code == 401:
+                self._invalidate_runtime_token("Runtime token rejected while pulling; re-enrolling")
+                return []
             res.raise_for_status()
             data = res.json() if res.content else {}
             self.status["last_pull_at"] = time.time()
@@ -199,7 +234,7 @@ class AgentRuntime:
             return items
 
         # Legacy mode: pull is available only with AGENT_API_TOKEN/SS14_API_TOKEN.
-        if not self.api_token:
+        if not self.api_token or self._legacy_auth_disabled:
             return []
 
         res = requests.get(
@@ -208,6 +243,10 @@ class AgentRuntime:
             headers=self._headers(),
             timeout=self.timeout,
         )
+        if res.status_code == 401:
+            self._legacy_auth_disabled = True
+            self.status["legacy_auth_disabled"] = True
+            return []
         res.raise_for_status()
         data = res.json() if res.content else {}
         self.status["last_pull_at"] = time.time()
@@ -217,19 +256,30 @@ class AgentRuntime:
 
     def _ack(self, instruction_id: str, ok: bool, result: dict[str, Any] | None = None, error: str | None = None) -> None:
         if self.agent_token:
-            requests.post(
+            res = requests.post(
                 f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions/{instruction_id}/ack",
                 json={"ok": bool(ok), "result": result or {}, "error": error},
                 headers=self._runtime_headers(),
                 timeout=self.timeout,
-            ).raise_for_status()
+            )
+            if res.status_code == 401:
+                self._invalidate_runtime_token("Runtime token rejected while ack; re-enrolling")
+                return
+            res.raise_for_status()
             return
-        requests.post(
+        if self._legacy_auth_disabled:
+            return
+        res = requests.post(
             f"{self.backend_url}/api/agent/instructions/{self.agent_id}/{instruction_id}/ack",
             json={"ok": bool(ok), "result": result or {}, "error": error},
             headers=self._headers(),
             timeout=self.timeout,
-        ).raise_for_status()
+        )
+        if res.status_code == 401:
+            self._legacy_auth_disabled = True
+            self.status["legacy_auth_disabled"] = True
+            return
+        res.raise_for_status()
 
     def _enroll_request(self) -> None:
         payload = {
@@ -344,9 +394,14 @@ class AgentRuntime:
                         self._enroll_request()
                     self._enroll_complete()
                 cfg, cfg_sha = self._read_config()
-                if not self.agent_token and self.api_token and not self.status.get("registered"):
+                if not self.agent_token and self.api_token and not self._legacy_auth_disabled and not self.status.get("registered"):
                     self._register(cfg, cfg_sha)
-                elif (not self.agent_token) and self.api_token and self.status.get("config_sha256") != cfg_sha:
+                elif (
+                    (not self.agent_token)
+                    and self.api_token
+                    and (not self._legacy_auth_disabled)
+                    and self.status.get("config_sha256") != cfg_sha
+                ):
                     # Re-register when config changed.
                     self._register(cfg, cfg_sha)
                 self._heartbeat(cfg_sha)
@@ -357,7 +412,12 @@ class AgentRuntime:
                         self._ack(instruction_id, ok=ok, result=result, error=error)
                 self.status["last_error"] = None
             except Exception as exc:
-                self.status["last_error"] = str(exc)
+                if isinstance(exc, HTTPError) and getattr(exc, "response", None) is not None:
+                    response = exc.response
+                    request_url = getattr(getattr(exc, "request", None), "url", None)
+                    self.status["last_error"] = f"{response.status_code} {response.reason}: {request_url or ''}".strip()
+                else:
+                    self.status["last_error"] = str(exc)
             self._stop.wait(self.poll_seconds)
 
     def start(self) -> None:
