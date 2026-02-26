@@ -163,6 +163,10 @@ class AgentRuntime:
             self.status["paired"] = True
             return
 
+        # Legacy mode: heartbeat is available only with AGENT_API_TOKEN/SS14_API_TOKEN.
+        if not self.api_token:
+            return
+
         payload = {
             "agent_id": self.agent_id,
             "status": "ok",
@@ -193,6 +197,10 @@ class AgentRuntime:
             items = data.get("instructions") or []
             self.status["last_instruction_count"] = len(items)
             return items
+
+        # Legacy mode: pull is available only with AGENT_API_TOKEN/SS14_API_TOKEN.
+        if not self.api_token:
+            return []
 
         res = requests.get(
             f"{self.backend_url}/api/agent/instructions/{self.agent_id}",
