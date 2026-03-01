@@ -4,18 +4,7 @@ Minimal remote agent used by Fabricator core.
 
 ## Install (Debian/Ubuntu)
 
-### Option A: Install from APT repository (recommended)
-
-`fabricator-agent` is not in the default Ubuntu/Debian repositories.
-`apt install fabricator-agent` works only after adding the Fabricator APT repo.
-
-```bash
-# add Fabricator APT repo first (URL/key are provided by Fabricator ops)
-sudo apt update
-sudo apt install -y fabricator-agent
-```
-
-### Option B: Build and install .deb locally
+### Install from GitHub repository
 
 ```bash
 sudo apt update
@@ -37,31 +26,6 @@ journalctl -u fabricator-agent -n 50 --no-pager
 Package installs and enables `fabricator-agent.service` automatically.
 
 ## Complete Install (Ubuntu)
-
-### APT install (recommended)
-
-```bash
-# 1) install package
-sudo apt update
-sudo apt install -y fabricator-agent
-
-# 2) configure runtime env
-sudo tee /etc/default/fabricator-agent >/dev/null <<'EOF'
-AGENT_BACKEND_URL=https://api.thun-der.ru
-AGENT_HTTP_PORT=8010
-AGENT_LOCAL_API_URL=http://127.0.0.1:8000
-EOF
-
-# 3) restart and verify
-sudo systemctl daemon-reload
-sudo systemctl enable --now fabricator-agent
-sudo systemctl restart fabricator-agent
-systemctl status fabricator-agent --no-pager
-curl -s http://127.0.0.1:8010/health
-curl -s http://127.0.0.1:8010/status
-```
-
-### Local .deb install
 
 ```bash
 # 1) build package
@@ -120,7 +84,12 @@ systemctl status fabricator-agent --no-pager || true
 
 ```bash
 sudo apt update
-sudo apt install -y fabricator-agent
+sudo apt install -y git build-essential debhelper dh-python python3 python3-venv
+git clone https://github.com/ren0san/fabricator-agent.git
+cd fabricator-agent
+dpkg-buildpackage -us -uc -b
+cd ..
+sudo apt install -y ./fabricator-agent_0.1.0-1_all.deb
 ```
 
 2. Set minimum required env:
@@ -271,8 +240,8 @@ If you see:
 E: Unable to locate package fabricator-agent
 ```
 
-it means the Fabricator APT repository is not configured on this machine (or package publication is not set up yet).
-Use "Local .deb install" via GitHub repo in this case.
+this is expected on a clean server without Fabricator APT repo.
+Use the GitHub install flow from this README (`git clone` + `dpkg-buildpackage` + local `.deb` install).
 
 If you see:
 
