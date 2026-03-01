@@ -19,7 +19,10 @@ sudo apt install -y fabricator-agent
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential debhelper dh-python python3 python3-venv
+sudo apt install -y ca-certificates curl build-essential debhelper dh-python python3 python3-venv
+curl -fsSL -o fabricator-agent.tar.gz https://github.com/ren0san/fabricator-agent/archive/refs/heads/main.tar.gz
+tar -xzf fabricator-agent.tar.gz
+cd fabricator-agent-main
 dpkg-buildpackage -us -uc -b
 cd ..
 sudo apt install -y ./fabricator-agent_0.1.0-1_all.deb
@@ -48,8 +51,6 @@ sudo tee /etc/default/fabricator-agent >/dev/null <<'EOF'
 AGENT_BACKEND_URL=https://api.thun-der.ru
 AGENT_HTTP_PORT=8010
 AGENT_LOCAL_API_URL=http://127.0.0.1:8000
-AGENT_LOCAL_API_TOKEN=CHANGE_ME_FABRICATOR_TOKEN
-AGENT_ADMIN_TOKEN=CHANGE_ME_STRONG_RANDOM_TOKEN
 EOF
 
 # 3) restart and verify
@@ -78,8 +79,6 @@ sudo tee /etc/default/fabricator-agent >/dev/null <<'EOF'
 AGENT_BACKEND_URL=https://api.thun-der.ru
 AGENT_HTTP_PORT=8010
 AGENT_LOCAL_API_URL=http://127.0.0.1:8000
-AGENT_LOCAL_API_TOKEN=CHANGE_ME_FABRICATOR_TOKEN
-AGENT_ADMIN_TOKEN=CHANGE_ME_STRONG_RANDOM_TOKEN
 EOF
 
 # 4) restart and verify
@@ -130,8 +129,6 @@ sudo tee /etc/default/fabricator-agent >/dev/null <<'EOF'
 AGENT_BACKEND_URL=https://api.thun-der.ru
 AGENT_HTTP_PORT=8010
 AGENT_LOCAL_API_URL=http://127.0.0.1:8000
-AGENT_LOCAL_API_TOKEN=CHANGE_ME_FABRICATOR_TOKEN
-AGENT_ADMIN_TOKEN=CHANGE_ME_STRONG_RANDOM_TOKEN
 EOF
 ```
 
@@ -146,6 +143,16 @@ curl -s http://127.0.0.1:8010/status
 ```
 
 4. On backend side complete bind for `agent_id` from `/status`, then wait until `status.paired=true`.
+
+Optional hardening (recommended for production):
+
+```bash
+LOCAL_TOKEN="$(openssl rand -hex 32)"
+ADMIN_TOKEN="$(openssl rand -hex 32)"
+echo "AGENT_LOCAL_API_TOKEN=${LOCAL_TOKEN}" | sudo tee -a /etc/default/fabricator-agent >/dev/null
+echo "AGENT_ADMIN_TOKEN=${ADMIN_TOKEN}" | sudo tee -a /etc/default/fabricator-agent >/dev/null
+sudo systemctl restart fabricator-agent
+```
 
 ## Quick Ops
 
@@ -186,8 +193,8 @@ curl -s -X POST http://127.0.0.1:8010/diagnostics/run \
 - `AGENT_HTTP_PORT`
 - `AGENT_API_TOKEN` (optional legacy mode; not required for runtime pairing flow)
 - `AGENT_LOCAL_API_URL` (default `http://127.0.0.1:8000`)
-- `AGENT_LOCAL_API_TOKEN` (token for local Fabricator API calls)
-- `AGENT_ADMIN_TOKEN` (required for local emergency diagnostic endpoint)
+- `AGENT_LOCAL_API_TOKEN` (optional; token for local Fabricator API calls)
+- `AGENT_ADMIN_TOKEN` (optional; required only for local emergency diagnostic endpoint `/diagnostics/run`)
 - `AGENT_DIAG_TIMEOUT_SECONDS` (default `45`)
 - `AGENT_OUTPUT_TAIL_CHARS` (default `4000`)
 - `AGENT_FABRICATOR_SERVICE` (default `ss14-provisioner`)
@@ -216,6 +223,7 @@ If runtime token becomes invalid (for example after rebind/reissue), agent clear
 `install-watchdog` is disabled in favor of fixed instruction kinds only.
 
 Instruction payload examples (from backend):
+(`repo` below is instance source repo for `create-instance`, not this agent install URL)
 
 - `create-instance`: `{"kind":"create-instance","payload":{"body":{"slug":"alpha","repo":"https://github.com/org/repo","branch":"master"}}}`
 - `restart-instance`: `{"kind":"restart-instance","payload":{"slug":"alpha"}}`
