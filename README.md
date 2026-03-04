@@ -14,25 +14,10 @@ if [ ! -d fabricator-agent/.git ]; then
 fi
 cd fabricator-agent
 
-# 2) Configure runtime env
-sudo tee /etc/default/fabricator-agent >/dev/null <<'EOF'
-AGENT_BACKEND_URL=https://api.thun-der.ru
-AGENT_HTTP_PORT=8010
-AGENT_LOCAL_API_URL=http://127.0.0.1:8000
-AGENT_TEST_MODE=0
-
-# Optional secure auto-bind flow
-AGENT_BOOTSTRAP_TOKEN=change_me
-AGENT_SLUG=tunnel-de
-
-# Optional local diagnostic endpoint protection
-AGENT_ADMIN_TOKEN=change_me
-EOF
-
-# 3) Build, install/reinstall, restart service
+# 2) Build, install/reinstall, restart service
 sudo bash scripts/remote_deploy.sh /root/fabricator-agent
 
-# 4) Verify
+# 3) Verify
 systemctl status fabricator-agent --no-pager || true
 curl -sS http://127.0.0.1:8010/health
 curl -sS http://127.0.0.1:8010/status
@@ -81,4 +66,27 @@ sudo rm -f /lib/systemd/system/fabricator-agent.service
 sudo systemctl daemon-reload
 sudo systemctl reset-failed
 systemctl status fabricator-agent --no-pager || true
+```
+
+## Optional Runtime Config
+
+By default installation works without manual env setup. If needed, override defaults:
+
+```bash
+sudo tee /etc/default/fabricator-agent >/dev/null <<'EOF'
+AGENT_BACKEND_URL=https://api.thun-der.ru
+AGENT_HTTP_PORT=8010
+AGENT_LOCAL_API_URL=http://127.0.0.1:8000
+AGENT_TEST_MODE=0
+
+# Optional secure auto-bind flow
+AGENT_BOOTSTRAP_TOKEN=
+AGENT_SLUG=
+
+# Optional local diagnostic endpoint protection
+AGENT_ADMIN_TOKEN=
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl restart fabricator-agent
 ```
