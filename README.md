@@ -5,19 +5,16 @@ Minimal remote agent used by Fabricator core.
 ## Complete Install (Ubuntu)
 
 ```bash
-# 1) Build package
+# 1) Fetch repository
 sudo apt update
 sudo apt install -y git build-essential debhelper dh-python python3 python3-venv
 cd /root
-git clone https://github.com/ren0san/fabricator-agent.git
+if [ ! -d fabricator-agent/.git ]; then
+  git clone https://github.com/ren0san/fabricator-agent.git
+fi
 cd fabricator-agent
-dpkg-buildpackage -us -uc -b
 
-# 2) Install package
-cd ..
-sudo apt install -y ./fabricator-agent_0.1.0-1_all.deb
-
-# 3) Configure runtime env
+# 2) Configure runtime env
 sudo tee /etc/default/fabricator-agent >/dev/null <<'EOF'
 AGENT_BACKEND_URL=https://api.thun-der.ru
 AGENT_HTTP_PORT=8010
@@ -26,35 +23,30 @@ AGENT_TEST_MODE=0
 
 # Optional secure auto-bind flow
 AGENT_BOOTSTRAP_TOKEN=change_me
-AGENT_SLUG=$(hostname -s)
+AGENT_SLUG=tunnel-de
 
 # Optional local diagnostic endpoint protection
 AGENT_ADMIN_TOKEN=change_me
 EOF
 
-# 4) Start service
-sudo systemctl daemon-reload
-sudo systemctl enable --now fabricator-agent
-sudo systemctl restart fabricator-agent
+# 3) Build, install/reinstall, restart service
+sudo bash scripts/remote_deploy.sh /root/fabricator-agent
 
-# 5) Verify
-systemctl status fabricator-agent --no-pager
-curl -s http://127.0.0.1:8010/health
-curl -s http://127.0.0.1:8010/status
+# 4) Verify
+systemctl status fabricator-agent --no-pager || true
+curl -sS http://127.0.0.1:8010/health
+curl -sS http://127.0.0.1:8010/status
 ```
 
 ## Complete Update (Ubuntu)
 
 ```bash
-# Option A: remote self-update from Fabricator core
-# Queue instruction kind: self-update-agent to target agent.
-# Agent executes by default:
-#   apt-get update && apt-get install -y --only-upgrade fabricator-agent
-# and schedules service restart.
+# Option A (recommended): trigger instruction from Fabricator core
+# kind = self-update-agent
 
-# Option B: manual update from repository
+# Option B: update manually from GitHub
 sudo apt update
-sudo apt install -y git build-essential debhelper dh-python python3 python3-venv
+sudo apt install -y git
 cd /root
 if [ ! -d fabricator-agent/.git ]; then
   git clone https://github.com/ren0san/fabricator-agent.git
@@ -63,12 +55,9 @@ cd fabricator-agent
 git fetch --all --prune
 git checkout main
 git pull --ff-only origin main
-dpkg-buildpackage -us -uc -b
-cd ..
-sudo apt install -y ./fabricator-agent_0.1.0-1_all.deb
-sudo systemctl daemon-reload
-sudo systemctl restart fabricator-agent
-systemctl status fabricator-agent --no-pager
+sudo bash scripts/remote_deploy.sh /root/fabricator-agent
+systemctl status fabricator-agent --no-pager || true
+curl -sS http://127.0.0.1:8010/status
 ```
 
 ## Complete Uninstall (Ubuntu)
