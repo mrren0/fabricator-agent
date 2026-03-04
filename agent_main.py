@@ -349,8 +349,20 @@ class AgentRuntime:
             json={"agent_id": self.agent_id, "claim_code": claim_code},
             timeout=self.timeout,
         )
-        if res.status_code in (400, 409):
-            # Not bound yet or invalid state: keep polling.
+        if res.status_code == 400:
+            # Self-heal stale claim codes when backend no longer has the pending row.
+            detail = ""
+            try:
+                payload = res.json() if res.content else {}
+                if isinstance(payload, dict):
+                    detail = str(payload.get("detail") or "").strip().lower()
+            except Exception:
+                detail = ""
+            if ("pending enrollment not found" in detail) or ("invalid claim_code" in detail):
+                self.status["claim_code"] = None
+            return False
+        if res.status_code == 409:
+            # Not bound yet: keep polling with the same claim code.
             return False
         res.raise_for_status()
         data = res.json() if res.content else {}
