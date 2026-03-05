@@ -341,6 +341,7 @@ class AgentRuntime:
                 self._invalidate_runtime_token("Runtime token rejected by backend; re-enrolling")
                 return
             res.raise_for_status()
+            self.status["registered"] = True
             self.status["last_heartbeat_at"] = time.time()
             self.status["paired"] = True
             return
@@ -495,6 +496,7 @@ class AgentRuntime:
         if not token:
             return False
         self.agent_token = token
+        self.status["registered"] = True
         self.status["paired"] = True
         self._save_token_file()
         return True
@@ -840,6 +842,13 @@ def status() -> dict[str, Any]:
         http_port = int(http_port_raw)
     except Exception:
         http_port = 8010
+    status_payload = dict(runtime.status)
+    registered_runtime = bool(runtime.agent_token)
+    registered_legacy = bool(status_payload.get("last_register_at"))
+    status_payload["registered_runtime"] = registered_runtime
+    status_payload["registered_legacy"] = registered_legacy
+    status_payload["registered"] = bool(registered_runtime or registered_legacy)
+
     return {
         "agent_id": runtime.agent_id,
         "backend_url": runtime.backend_url,
@@ -850,7 +859,7 @@ def status() -> dict[str, Any]:
         "app": _build_info(),
         "supported_instruction_kinds": runtime.supported_instruction_kinds(),
         "diagnostics": sorted(runtime._diagnostic_specs().keys()),
-        "status": dict(runtime.status),
+        "status": status_payload,
     }
 
 
