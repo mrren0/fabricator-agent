@@ -7,6 +7,7 @@ long-polls for instructions.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import secrets
 import socket
@@ -42,6 +43,70 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_ip(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return str(ipaddress.ip_address(raw))
+    except Exception:
+        return ""
+
+
+def _is_public_ip(value: str | None) -> bool:
+    ip = _normalize_ip(value)
+    if not ip:
+        return False
+    addr = ipaddress.ip_address(ip)
+    return not (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+    )
+
+
+def _probe_public_ip_from_web() -> str:
+    probe_url = _env("AGENT_PUBLIC_IP_URL", "https://api64.ipify.org")
+    if not probe_url:
+        return ""
+    try:
+        res = requests.get(probe_url, timeout=4)
+        if res.status_code >= 400:
+            return ""
+        return _normalize_ip((res.text or "").strip())
+    except Exception:
+        return ""
+
+
+def _detect_public_ip() -> str:
+    override = _normalize_ip(_env("AGENT_PUBLIC_IP"))
+    if override:
+        return override
+
+    local_egress = ""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("1.1.1.1", 80))
+            local_egress = _normalize_ip(sock.getsockname()[0])
+        finally:
+            sock.close()
+    except Exception:
+        local_egress = ""
+
+    if _is_public_ip(local_egress):
+        return local_egress
+
+    external = _probe_public_ip_from_web()
+    if _is_public_ip(external):
+        return external
+
+    return local_egress or external
 
 
 APP_VERSION = (_env("FABRICATOR_AGENT_VERSION", "0.1.0") or "0.1.0").strip() or "0.1.0"
@@ -83,6 +148,7 @@ class AgentRuntime:
         self.agent_id_file = Path(_env("AGENT_ID_FILE", "/opt/fabricator-agent/agent.id") or "/opt/fabricator-agent/agent.id")
         self.agent_id = self._resolve_agent_id()
         self.hostname = socket.gethostname()
+        self.public_ip = _detect_public_ip()
         self.location = _env("AGENT_LOCATION")
         self.config_path = Path(
             _env("AGENT_CONFIG_PATH", "/etc/fabricator-agent/config.toml") or "/etc/fabricator-agent/config.toml"
@@ -241,7 +307,7 @@ class AgentRuntime:
                 "status": "ok",
                 "config_sha256": cfg_sha,
                 "metrics": {},
-                "details": {},
+                "details": {"public_ip": self.public_ip or None},
             }
             res = requests.post(
                 f"{self.backend_url}/api/agent/runtime/{self.agent_id}/heartbeat",
@@ -266,7 +332,7 @@ class AgentRuntime:
             "status": "ok",
             "config_sha256": cfg_sha,
             "metrics": {},
-            "details": {},
+            "details": {"public_ip": self.public_ip or None},
         }
         res = requests.post(
             f"{self.backend_url}/api/agent/heartbeat",
@@ -353,9 +419,11 @@ class AgentRuntime:
             "agent_id": self.agent_id,
             "public_key": self.public_key,
             "hostname": self.hostname,
+            "public_ip": self.public_ip or None,
             "details": {
                 "location": self.location,
                 "slug": self.agent_slug,
+                "public_ip": self.public_ip or None,
             },
         }
         headers = {"Content-Type": "application/json"}
