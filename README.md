@@ -78,6 +78,7 @@ AGENT_BACKEND_URL=https://api.thun-der.ru
 AGENT_HTTP_PORT=8010
 AGENT_LOCAL_API_URL=http://127.0.0.1:8000
 AGENT_TEST_MODE=0
+AGENT_PUBLIC_IP=
 
 # Optional secure auto-bind flow
 AGENT_BOOTSTRAP_TOKEN=

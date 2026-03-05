@@ -307,7 +307,10 @@ class AgentRuntime:
                 "status": "ok",
                 "config_sha256": cfg_sha,
                 "metrics": {},
-                "details": {"public_ip": self.public_ip or None},
+                "details": {
+                    "public_ip": self.public_ip or None,
+                    "agent_version": APP_VERSION,
+                },
             }
             res = requests.post(
                 f"{self.backend_url}/api/agent/runtime/{self.agent_id}/heartbeat",
@@ -332,7 +335,10 @@ class AgentRuntime:
             "status": "ok",
             "config_sha256": cfg_sha,
             "metrics": {},
-            "details": {"public_ip": self.public_ip or None},
+            "details": {
+                "public_ip": self.public_ip or None,
+                "agent_version": APP_VERSION,
+            },
         }
         res = requests.post(
             f"{self.backend_url}/api/agent/heartbeat",
