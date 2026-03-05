@@ -112,6 +112,22 @@ def _detect_public_ip() -> str:
 APP_VERSION = (_env("FABRICATOR_AGENT_VERSION", "0.1.0") or "0.1.0").strip() or "0.1.0"
 
 
+def _file_sha12(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+        return hashlib.sha256(data).hexdigest()[:12]
+    except Exception:
+        return "unknown"
+
+
+AGENT_BUILD = (_env("FABRICATOR_AGENT_BUILD") or "").strip() or _file_sha12(Path(__file__).resolve())
+AGENT_VERSION_DISPLAY = (
+    APP_VERSION
+    if ("+" in APP_VERSION or APP_VERSION.endswith(AGENT_BUILD))
+    else f"{APP_VERSION}+{AGENT_BUILD}"
+)
+
+
 def _run_git(*args: str) -> str | None:
     try:
         out = subprocess.check_output(
@@ -131,7 +147,9 @@ def _run_git(*args: str) -> str | None:
 def _build_info() -> dict[str, Any]:
     return {
         "service": "fabricator-agent",
-        "version": APP_VERSION,
+        "version": AGENT_VERSION_DISPLAY,
+        "version_base": APP_VERSION,
+        "build": AGENT_BUILD,
         "tag": _run_git("describe", "--tags", "--abbrev=0"),
         "commit": _run_git("rev-parse", "--short=12", "HEAD"),
         "dirty": bool(_run_git("status", "--porcelain")),
@@ -309,7 +327,8 @@ class AgentRuntime:
                 "metrics": {},
                 "details": {
                     "public_ip": self.public_ip or None,
-                    "agent_version": APP_VERSION,
+                    "agent_version": AGENT_VERSION_DISPLAY,
+                    "agent_build": AGENT_BUILD,
                 },
             }
             res = requests.post(
@@ -337,7 +356,8 @@ class AgentRuntime:
             "metrics": {},
             "details": {
                 "public_ip": self.public_ip or None,
-                "agent_version": APP_VERSION,
+                "agent_version": AGENT_VERSION_DISPLAY,
+                "agent_build": AGENT_BUILD,
             },
         }
         res = requests.post(
@@ -790,7 +810,7 @@ class AgentRuntime:
 
 
 runtime = AgentRuntime()
-app = FastAPI(title="Fabricator Agent", version=APP_VERSION)
+app = FastAPI(title="Fabricator Agent", version=AGENT_VERSION_DISPLAY)
 
 
 class DiagnosticRunRequest(BaseModel):
@@ -815,10 +835,17 @@ def health() -> dict[str, Any]:
 
 @app.get("/status")
 def status() -> dict[str, Any]:
+    http_port_raw = _env("AGENT_HTTP_PORT", "8010") or "8010"
+    try:
+        http_port = int(http_port_raw)
+    except Exception:
+        http_port = 8010
     return {
         "agent_id": runtime.agent_id,
         "backend_url": runtime.backend_url,
         "poll_seconds": runtime.poll_seconds,
+        "runtime_pid": os.getpid(),
+        "http_port": http_port,
         "config_path": str(runtime.config_path),
         "app": _build_info(),
         "supported_instruction_kinds": runtime.supported_instruction_kinds(),
