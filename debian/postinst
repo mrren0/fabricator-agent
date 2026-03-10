@@ -16,6 +16,17 @@ replace_or_append() {
   fi
 }
 
+remove_exact_setting() {
+  key="$1"
+  value="$2"
+  file="$3"
+  if [ ! -f "$file" ]; then
+    return 0
+  fi
+  escaped_value="$(printf '%s' "$value" | sed 's/[.[\*^$(){}?+|/]/\\&/g')"
+  sed -i "/^${key}=${escaped_value}\$/d" "$file"
+}
+
 if [ "$1" = "configure" ] || [ "$1" = "reconfigure" ]; then
   mkdir -p /opt/fabricator-agent /etc/fabricator-agent
 
@@ -33,6 +44,10 @@ EOF
   else
     replace_or_append AGENT_TEST_MODE 0 /etc/default/fabricator-agent
   fi
+
+  # Remote-only agents must not silently fallback into a nonexistent local
+  # Fabricator backend. Remove the legacy default if it is still present.
+  remove_exact_setting AGENT_LOCAL_API_URL http://127.0.0.1:8000 /etc/default/fabricator-agent
 
   PKG_VERSION="$(dpkg-query -W -f='${Version}' fabricator-agent 2>/dev/null || true)"
   if [ -n "${PKG_VERSION}" ]; then
