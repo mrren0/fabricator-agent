@@ -42,11 +42,27 @@ def _env(name: str, default: str | None = None) -> str | None:
 logger = logging.getLogger("fabricator-agent")
 
 
+DEFAULT_LOCAL_EDGE_URL = "http://127.0.0.1:8000"
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = _env(name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _default_local_api_url() -> str:
+    return (_env("AGENT_LOCAL_API_URL", DEFAULT_LOCAL_EDGE_URL) or DEFAULT_LOCAL_EDGE_URL).rstrip("/")
+
+
+def _local_api_token(runtime: "AgentRuntime") -> str:
+    return (
+        _env("AGENT_LOCAL_API_TOKEN")
+        or _env("SS14_EDGE_API_TOKEN")
+        or runtime.api_token
+        or ""
+    )
 
 
 def _normalize_ip(value: str | None) -> str:
@@ -754,23 +770,22 @@ class AgentRuntime:
                 return True, result, None
             return False, result, f"create-slug command failed with code {proc.returncode}"
 
-        # Remote-only agents must not silently assume a local fabricator backend.
-        local_api = (_env("AGENT_LOCAL_API_URL") or "").rstrip("/")
-        token = _env("AGENT_LOCAL_API_TOKEN") or self.api_token
-        if not local_api:
+        local_api = _default_local_api_url()
+        token = _local_api_token(self)
+        headers = {"X-API-Token": token or "", "Content-Type": "application/json"}
+        try:
+            res = requests.post(
+                f"{local_api}/api/ss14/instances",
+                json=body or {},
+                headers=headers,
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
             return (
                 False,
-                {},
-                "remote agent has no local fabricator API configured; "
-                "set payload.command/AGENT_CREATE_SLUG_COMMAND or explicitly configure AGENT_LOCAL_API_URL",
+                {"local_api": local_api},
+                f"local edge API is unreachable at {local_api}: {exc}",
             )
-        headers = {"X-API-Token": token or "", "Content-Type": "application/json"}
-        res = requests.post(
-            f"{local_api}/api/ss14/instances",
-            json=body or {},
-            headers=headers,
-            timeout=self.timeout,
-        )
         ok = res.status_code < 400
         try:
             data: Any = res.json()
@@ -827,8 +842,8 @@ class AgentRuntime:
             "update-instance",
             "repair-instance",
         }:
-            local_api = (_env("AGENT_LOCAL_API_URL") or "").rstrip("/")
-            token = _env("AGENT_LOCAL_API_TOKEN") or self.api_token
+            local_api = _default_local_api_url()
+            token = _local_api_token(self)
             endpoints = {
                 "create-instance": ("POST", "/api/ss14/instances"),
                 "delete-instance": ("DELETE", f"/api/ss14/instances/{payload.get('slug', '')}"),
@@ -840,15 +855,6 @@ class AgentRuntime:
             method, path = endpoints[kind]
             if kind != "create-instance" and not str(payload.get("slug") or "").strip():
                 return False, {}, "payload.slug is required"
-            if not local_api:
-                if kind == "create-instance":
-                    return (
-                        False,
-                        {},
-                        "remote agent has no local fabricator API configured; "
-                        "explicitly configure AGENT_LOCAL_API_URL for create-instance",
-                    )
-                return False, {}, "AGENT_LOCAL_API_URL is not configured for remote instance control"
             url = f"{local_api}{path}"
             headers = {"X-API-Token": token or "", "Content-Type": "application/json"}
             kwargs: dict[str, Any] = {"headers": headers, "timeout": self.timeout}
@@ -858,7 +864,10 @@ class AgentRuntime:
                 reason = str(payload.get("reason") or "").strip()
                 if reason:
                     headers["X-Reason"] = reason
-            res = requests.request(method, url, **kwargs)
+            try:
+                res = requests.request(method, url, **kwargs)
+            except requests.RequestException as exc:
+                return False, {"local_api": local_api}, f"local edge API is unreachable at {local_api}: {exc}"
             ok = res.status_code < 400
             data: Any
             try:

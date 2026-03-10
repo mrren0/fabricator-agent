@@ -102,6 +102,14 @@ sudo systemctl daemon-reload
 sudo systemctl restart fabricator-agent
 ```
 
+Remote-only default behavior:
+
+- if `AGENT_LOCAL_API_URL` is empty, the agent tries `http://127.0.0.1:8000`
+- local edge token fallback order:
+  - `AGENT_LOCAL_API_TOKEN`
+  - `SS14_EDGE_API_TOKEN`
+  - `AGENT_API_TOKEN` / `SS14_API_TOKEN`
+
 ## Version check (terminal)
 
 ```bash
