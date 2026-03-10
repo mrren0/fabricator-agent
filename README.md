@@ -109,6 +109,8 @@ Remote-only default behavior:
   - `AGENT_LOCAL_API_TOKEN`
   - `SS14_EDGE_API_TOKEN`
   - `AGENT_API_TOKEN` / `SS14_API_TOKEN`
+- for `create-slug`, the agent now first tries built-in local Watchdog provisioning
+- set `AGENT_EMBEDDED_CREATE_SLUG=0` only if you explicitly want to force the old local HTTP API path
 
 ## Version check (terminal)
 

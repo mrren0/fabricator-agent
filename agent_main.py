@@ -10,7 +10,10 @@ import hashlib
 import ipaddress
 import logging
 import os
+import pwd
+import grp
 import secrets
+import shutil
 import socket
 import subprocess
 import threading
@@ -19,6 +22,7 @@ import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from fastapi import FastAPI, Header, HTTPException, status
@@ -63,6 +67,42 @@ def _local_api_token(runtime: "AgentRuntime") -> str:
         or runtime.api_token
         or ""
     )
+
+
+def _normalize_host(raw: str | None) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    try:
+        parsed = urlparse(s if "://" in s else f"dummy://{s}")
+        host = (parsed.hostname or "").strip()
+        if host:
+            return host
+    except Exception:
+        pass
+    s = s.split("/")[0]
+    s = s.split(":")[0]
+    return s.strip()
+
+
+def _is_ip_literal(value: str | None) -> bool:
+    host = _normalize_host(value)
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except Exception:
+        return False
+
+
+def _build_server_url(public_host: str, slug: str, port: int) -> str:
+    host = _normalize_host(public_host)
+    if host and not _is_ip_literal(host):
+        return f"ss14s://{host}/{slug}"
+    if host:
+        return f"ss14://{host}:{port}"
+    return f"ss14://127.0.0.1:{port}"
 
 
 def _normalize_ip(value: str | None) -> str:
@@ -734,6 +774,281 @@ class AgentRuntime:
             None,
         )
 
+    def _embedded_allocate_port(self, requested_port: int, instances_dir: Path, fragments_dir: Path) -> int:
+        try:
+            port_min = int(_env("SS14_PORT_MIN", "14000") or "14000")
+            port_max = int(_env("SS14_PORT_MAX", "14999") or "14999")
+        except Exception as exc:
+            raise RuntimeError(f"invalid SS14_PORT_MIN/SS14_PORT_MAX: {exc}")
+
+        if requested_port not in (0, 1):
+            if not self._embedded_is_port_free(requested_port):
+                raise RuntimeError(f"Port {requested_port} is already in use")
+            return requested_port
+
+        used_ports: set[int] = set()
+        for cfg_file in instances_dir.glob("*/config.toml"):
+            try:
+                for line in cfg_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("port ="):
+                        used_ports.add(int(stripped.split("=", 1)[1].strip()))
+                        break
+            except Exception:
+                continue
+        for frag_file in fragments_dir.glob("*.yml"):
+            try:
+                for line in frag_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("ApiPort:"):
+                        used_ports.add(int(stripped.split(":", 1)[1].strip()))
+                        break
+            except Exception:
+                continue
+        for port in range(port_min, port_max + 1):
+            if port in used_ports:
+                continue
+            if self._embedded_is_port_free(port):
+                return port
+        raise RuntimeError(f"No free ports available in range {port_min}..{port_max}")
+
+    def _embedded_is_port_free(self, port: int) -> bool:
+        def _try_bind(fam: int, typ: int, addr: str) -> bool:
+            sock = socket.socket(fam, typ)
+            try:
+                sock.settimeout(1.0)
+                if typ == socket.SOCK_STREAM:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if fam == socket.AF_INET6:
+                    try:
+                        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    except Exception:
+                        pass
+                    bind_addr = (addr, port, 0, 0)
+                else:
+                    bind_addr = (addr, port)
+                sock.bind(bind_addr)
+                return True
+            except OSError:
+                return False
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+        if not _try_bind(socket.AF_INET, socket.SOCK_STREAM, "0.0.0.0"):
+            return False
+        if not _try_bind(socket.AF_INET, socket.SOCK_DGRAM, "0.0.0.0"):
+            return False
+        try:
+            if not _try_bind(socket.AF_INET6, socket.SOCK_STREAM, "::"):
+                return False
+            if not _try_bind(socket.AF_INET6, socket.SOCK_DGRAM, "::"):
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _embedded_rebuild_appsettings(self, appsettings_base: Path, appsettings_out: Path, fragments_dir: Path) -> None:
+        tmp = appsettings_out.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fp:
+            fp.write(appsettings_base.read_text(encoding="utf-8"))
+            for frag in sorted(fragments_dir.glob("*.yml")):
+                fp.write(frag.read_text(encoding="utf-8"))
+        tmp.replace(appsettings_out)
+
+    def _embedded_fix_ownership(self, path: Path, user: str, group: str, recursive: bool = True) -> None:
+        try:
+            uid = pwd.getpwnam(user).pw_uid
+            gid = grp.getgrnam(group).gr_gid
+        except Exception:
+            return
+        targets = [path]
+        if recursive and path.is_dir():
+            targets.extend(path.rglob("*"))
+        for target in targets:
+            try:
+                os.chown(target, uid, gid)
+            except Exception:
+                pass
+
+    def _embedded_restart_watchdog(self, service_name: str) -> None:
+        subprocess.run(
+            ["systemctl", "restart", service_name],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _embedded_notify_watchdog_update(self, watchdog_url: str, slug: str, api_token: str) -> dict[str, Any]:
+        try:
+            parsed = urlparse(watchdog_url)
+            if parsed.scheme and parsed.netloc:
+                watchdog_url = f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            watchdog_url = watchdog_url.rstrip("/")
+        res = requests.post(
+            f"{watchdog_url.rstrip('/')}/instances/{slug}/update",
+            auth=(slug, api_token),
+            timeout=max(5, self.timeout),
+        )
+        return {
+            "status_code": res.status_code,
+            "body_tail": (res.text or "")[-self.output_tail_chars :],
+        }
+
+    def _embedded_create_slug(self, body: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
+        slug = str(body.get("slug") or "").strip().lower()
+        repo = str(body.get("repo") or "").strip()
+        branch = str(body.get("branch") or "master").strip() or "master"
+        public_host = _normalize_host(str(body.get("public_host") or _env("SS14_PUBLIC_HOST", "ss-14.ru") or "ss-14.ru"))
+        host_user = str(body.get("host_user") or "Ren0san").strip() or "Ren0san"
+
+        if not slug:
+            return False, {}, "payload.body.slug is required"
+        if not repo.startswith("https://"):
+            return False, {}, "Repository URL must start with https://"
+        if not (3 <= len(slug) <= 64 and all(ch in "abcdefghijklmnopqrstuvwxyz0123456789_-" for ch in slug)):
+            return False, {}, "Slug must be 3..64 characters of a-z, 0-9, '-' or '_'"
+
+        wd_root = Path(_env("SS14_WD_ROOT", "/opt/ss14/wds/watchdog") or "/opt/ss14/wds/watchdog")
+        instances_dir = wd_root / "instances"
+        fragments_dir = wd_root / "instances.d"
+        appsettings_base = wd_root / "appsettings.base.yml"
+        appsettings_out = wd_root / "appsettings.yml"
+        inst_dir = instances_dir / slug
+        frag_file = fragments_dir / f"{slug}.yml"
+        watchdog_url = (_env("SS14_WD_URL", "http://127.0.0.1:13000") or "http://127.0.0.1:13000").rstrip("/")
+        watchdog_service = _env("SS14_WD_SYSTEMD_SERVICE", "SS14.Watchdog") or "SS14.Watchdog"
+        wd_fs_user = _env("SS14_WD_FS_USER") or _env("SS14_WD_USER") or "ss14"
+        wd_fs_group = _env("SS14_WD_FS_GROUP") or _env("SS14_WD_GROUP") or wd_fs_user
+
+        try:
+            explicit_port = int(body.get("port") or 1)
+        except Exception:
+            return False, {}, "Port must be an integer"
+
+        try:
+            port = self._embedded_allocate_port(explicit_port, instances_dir, fragments_dir)
+        except Exception as exc:
+            return False, {}, str(exc)
+
+        if inst_dir.exists():
+            return False, {"dir_path": str(inst_dir)}, f"Directory for instance '{slug}' already exists"
+        if frag_file.exists():
+            return False, {"fragment_path": str(frag_file)}, f"Watchdog fragment for instance '{slug}' already exists"
+
+        api_token = secrets.token_hex(8)
+        server_url = _build_server_url(public_host, slug, port)
+        udp_host = public_host or "127.0.0.1"
+        config_content = (
+            f"[net]\n"
+            f"tickrate = 30\n"
+            f"port = {port}\n"
+            f"log_late_msg = false\n"
+            f"#bindto = \"0.0.0.0\"\n\n"
+            f"[hub]\n"
+            f"advertise = true\n"
+            f"server_url = \"{server_url}\"\n"
+            f"hub_urls = \"https://hub.spacestation14.com/,https://hub.singularity14.co.uk/\"\n"
+            f"tags = \"lang:ru,region:eu_e\"\n\n"
+            f"[status]\n"
+            f"bind = \"*:{port}\"\n"
+            f"connectaddress = \"udp://{udp_host}:{port}\"\n\n"
+            f"[game]\n"
+            f"hostname = \"[RU] {slug}\"\n"
+            f"desc = \"Авто-инстанс {slug}\"\n"
+            f"maxplayers = 30\n"
+            f"soft_max_players = 30\n"
+            f"auto_pause_empty = true\n"
+            f"lobbyenabled = true\n"
+            f"lobbyduration = 60\n"
+            f"role_timers = false\n"
+            f"maxcharacterslots = 3\n"
+            f"station_goals = false\n\n"
+            f"[loki]\n"
+            f"name = \"{slug}\"\n"
+            f"username = \"{slug}\"\n"
+            f"password = \"{api_token}\"\n"
+            f"address = \"http://127.0.0.1:3100\"\n"
+            f"enabled = true\n\n"
+            f"[watchdog]\n"
+            f"token = \"{api_token}\"\n\n"
+            f"[console]\n"
+            f"loginlocal = true\n"
+            f"login_host_user = \"{host_user}\"\n"
+        )
+        yaml_content = (
+            f"    {slug}:\n"
+            f"      Name: \"{slug}\"\n"
+            f"      ApiToken: \"{api_token}\"\n"
+            f"      ApiPort: {port}\n"
+            f"      ConfigFileName: \"config.toml\"\n"
+            f"      UpdateType: \"Git\"\n"
+            f"      Updates:\n"
+            f"        BaseUrl: \"{repo}\"\n"
+            f"        Branch: \"{branch}\"\n"
+            f"      TimeoutSeconds: 120\n"
+        )
+
+        created_inst_dir = False
+        created_frag = False
+        try:
+            instances_dir.mkdir(parents=True, exist_ok=True)
+            fragments_dir.mkdir(parents=True, exist_ok=True)
+            inst_dir.mkdir(parents=True, exist_ok=False)
+            created_inst_dir = True
+            (inst_dir / "config.toml").write_text(config_content, encoding="utf-8")
+            frag_file.write_text(yaml_content, encoding="utf-8")
+            created_frag = True
+
+            if not appsettings_base.exists():
+                appsettings_base.write_text(
+                    "Serilog:\n"
+                    "  MinimumLevel:\n"
+                    "    Default: Information\n"
+                    "    Override:\n"
+                    "      SS14: Debug\n"
+                    "      Microsoft: Warning\n\n"
+                    "Urls: \"http://127.0.0.1:13000\"\n"
+                    "BaseUrl: \"http://127.0.0.1:13000/\"\n\n"
+                    "Process:\n"
+                    "  PersistServers: true\n\n"
+                    "Servers:\n"
+                    "  Instances:\n",
+                    encoding="utf-8",
+                )
+            self._embedded_rebuild_appsettings(appsettings_base, appsettings_out, fragments_dir)
+            self._embedded_fix_ownership(inst_dir, wd_fs_user, wd_fs_group)
+            self._embedded_fix_ownership(fragments_dir, wd_fs_user, wd_fs_group, recursive=False)
+            self._embedded_fix_ownership(instances_dir, wd_fs_user, wd_fs_group, recursive=False)
+            self._embedded_restart_watchdog(watchdog_service)
+            update_result = self._embedded_notify_watchdog_update(watchdog_url, slug, api_token)
+            return True, {
+                "mode": "embedded",
+                "slug": slug,
+                "port": port,
+                "repo": repo,
+                "branch": branch,
+                "dir_path": str(inst_dir),
+                "fragment_path": str(frag_file),
+                "token": api_token,
+                "watchdog_update": update_result,
+            }, None
+        except Exception as exc:
+            try:
+                if created_frag and frag_file.exists():
+                    frag_file.unlink()
+            except Exception:
+                pass
+            try:
+                if created_inst_dir and inst_dir.exists():
+                    shutil.rmtree(inst_dir, ignore_errors=True)
+            except Exception:
+                pass
+            return False, {"mode": "embedded", "slug": slug}, f"embedded create-slug failed: {exc}"
+
     def _run_create_slug(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
         body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
         slug = str((body or {}).get("slug") or "").strip()
@@ -769,6 +1084,9 @@ class AgentRuntime:
             if proc.returncode == 0:
                 return True, result, None
             return False, result, f"create-slug command failed with code {proc.returncode}"
+
+        if _env_bool("AGENT_EMBEDDED_CREATE_SLUG", True):
+            return self._embedded_create_slug(body or {})
 
         local_api = _default_local_api_url()
         token = _local_api_token(self)
