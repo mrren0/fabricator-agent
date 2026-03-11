@@ -186,6 +186,10 @@ AGENT_VERSION_DISPLAY = (
     if ("+" in APP_VERSION or APP_VERSION.endswith(AGENT_BUILD))
     else f"{APP_VERSION}+{AGENT_BUILD}"
 )
+try:
+    AGENT_INSTALLED_AT = float(Path(__file__).resolve().stat().st_mtime)
+except Exception:
+    AGENT_INSTALLED_AT = 0.0
 
 
 def _default_self_update_command() -> str:
@@ -233,9 +237,11 @@ def _run_git(*args: str) -> str | None:
 def _build_info() -> dict[str, Any]:
     return {
         "service": "fabricator-agent",
-        "version": AGENT_VERSION_DISPLAY,
+        "version": APP_VERSION,
         "version_base": APP_VERSION,
+        "version_full": AGENT_VERSION_DISPLAY,
         "build": AGENT_BUILD,
+        "installed_at": AGENT_INSTALLED_AT,
         "tag": _run_git("describe", "--tags", "--abbrev=0"),
         "commit": _run_git("rev-parse", "--short=12", "HEAD"),
         "dirty": bool(_run_git("status", "--porcelain")),
@@ -419,8 +425,11 @@ class AgentRuntime:
                 "metrics": {},
                 "details": {
                     "public_ip": self.public_ip or None,
-                    "agent_version": AGENT_VERSION_DISPLAY,
+                    "agent_version": APP_VERSION,
+                    "agent_version_full": AGENT_VERSION_DISPLAY,
+                    "agent_version_base": APP_VERSION,
                     "agent_build": AGENT_BUILD,
+                    "agent_installed_at": AGENT_INSTALLED_AT,
                 },
             }
             res = requests.post(
@@ -449,8 +458,11 @@ class AgentRuntime:
             "metrics": {},
             "details": {
                 "public_ip": self.public_ip or None,
-                "agent_version": AGENT_VERSION_DISPLAY,
+                "agent_version": APP_VERSION,
+                "agent_version_full": AGENT_VERSION_DISPLAY,
+                "agent_version_base": APP_VERSION,
                 "agent_build": AGENT_BUILD,
+                "agent_installed_at": AGENT_INSTALLED_AT,
             },
         }
         res = requests.post(
