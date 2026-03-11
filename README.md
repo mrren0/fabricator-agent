@@ -112,7 +112,7 @@ Remote-only default behavior:
 - for `create-slug`, the agent now first tries built-in local Watchdog provisioning
 - set `AGENT_EMBEDDED_CREATE_SLUG=0` only if you explicitly want to force the old local HTTP API path
 - built-in provisioning auto-detects common systemd unit names for Watchdog if `SS14_WD_SYSTEMD_SERVICE` is not set
-- built-in provisioning now prefers a dedicated per-slug unit: `ss14-watchdog-<slug>.service`
+- built-in provisioning follows the same model as master backend: one shared Watchdog installation manages many slugs
 
 ## Version check (terminal)
 

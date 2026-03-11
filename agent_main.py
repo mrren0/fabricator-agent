@@ -946,64 +946,6 @@ class AgentRuntime:
             "body_tail": (res.text or "")[-self.output_tail_chars :],
         }
 
-    def _embedded_find_watchdog_exec(self, source_root: Path) -> tuple[list[str], str]:
-        exe = source_root / "SS14.Watchdog"
-        dll = source_root / "SS14.Watchdog.dll"
-        if exe.exists():
-            return [str(exe)], "binary"
-        if dll.exists():
-            return ["dotnet", str(dll)], "dotnet"
-
-        search_roots = [source_root, source_root.parent, Path("/opt/ss14"), Path("/opt")]
-        for root in search_roots:
-            try:
-                found_dll = next(root.rglob("SS14.Watchdog.dll"))
-                return ["dotnet", str(found_dll)], "dotnet"
-            except Exception:
-                pass
-            try:
-                found_exe = next(root.rglob("SS14.Watchdog"))
-                return [str(found_exe)], "binary"
-            except Exception:
-                pass
-        raise RuntimeError(f"SS14.Watchdog executable not found under {source_root}")
-
-    def _embedded_write_slug_watchdog_unit(
-        self,
-        *,
-        slug: str,
-        runtime_root: Path,
-        source_root: Path,
-        service_user: str,
-        service_group: str,
-    ) -> tuple[str, Path]:
-        unit_name = f"ss14-watchdog-{slug}.service"
-        unit_path = Path("/etc/systemd/system") / unit_name
-        exec_argv, exec_mode = self._embedded_find_watchdog_exec(source_root)
-        quoted_exec = " ".join(f'"{part}"' if (" " in part or "/" in part) else part for part in exec_argv)
-        unit_content = (
-            "[Unit]\n"
-            f"Description=SS14 Watchdog ({slug})\n"
-            "After=network.target\n\n"
-            "[Service]\n"
-            "Type=simple\n"
-            f"WorkingDirectory={runtime_root}\n"
-            f"ExecStart=/bin/sh -lc 'exec {quoted_exec}'\n"
-            "Restart=on-failure\n"
-            "RestartSec=2\n"
-            f"User={service_user}\n"
-            f"Group={service_group}\n\n"
-            "[Install]\n"
-            "WantedBy=multi-user.target\n"
-        )
-        unit_path.write_text(unit_content, encoding="utf-8")
-        return unit_name, unit_path
-
-    def _embedded_enable_and_restart_unit(self, unit_name: str) -> None:
-        subprocess.run(["systemctl", "daemon-reload"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["systemctl", "enable", unit_name], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["systemctl", "restart", unit_name], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
     def _embedded_create_slug(self, body: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
         slug = str(body.get("slug") or "").strip().lower()
         repo = str(body.get("repo") or "").strip()
@@ -1018,27 +960,15 @@ class AgentRuntime:
         if not (3 <= len(slug) <= 64 and all(ch in "abcdefghijklmnopqrstuvwxyz0123456789_-" for ch in slug)):
             return False, {}, "Slug must be 3..64 characters of a-z, 0-9, '-' or '_'"
 
-        source_root = Path(_env("SS14_WD_ROOT", "/opt/ss14/wds/watchdog") or "/opt/ss14/wds/watchdog")
-        runtime_root_base = Path(
-            _env("SS14_WD_RUNTIME_ROOT_BASE", str(source_root.parent / "runtimes")) or str(source_root.parent / "runtimes")
-        )
-        runtime_root = runtime_root_base / slug
-        instances_dir = runtime_root / "instances"
-        fragments_dir = runtime_root / "instances.d"
-        appsettings_base = runtime_root / "appsettings.base.yml"
-        appsettings_out = runtime_root / "appsettings.yml"
+        wd_root = Path(_env("SS14_WD_ROOT", "/opt/ss14/wds/watchdog") or "/opt/ss14/wds/watchdog")
+        instances_dir = wd_root / "instances"
+        fragments_dir = wd_root / "instances.d"
+        appsettings_base = wd_root / "appsettings.base.yml"
+        appsettings_out = wd_root / "appsettings.yml"
         inst_dir = instances_dir / slug
         frag_file = fragments_dir / f"{slug}.yml"
-        try:
-            wd_api_port = self._embedded_allocate_port(
-                int(_env("SS14_WD_API_PORT", "1") or "1"),
-                runtime_root_base,
-                runtime_root_base,
-            )
-        except Exception:
-            wd_api_port = 13000
-        watchdog_url = f"http://127.0.0.1:{wd_api_port}"
-        watchdog_service = _env("SS14_WD_SYSTEMD_SERVICE", f"ss14-watchdog-{slug}.service") or f"ss14-watchdog-{slug}.service"
+        watchdog_url = (_env("SS14_WD_URL", "http://127.0.0.1:13000") or "http://127.0.0.1:13000").rstrip("/")
+        watchdog_service = _env("SS14_WD_SYSTEMD_SERVICE", "SS14.Watchdog") or "SS14.Watchdog"
         wd_fs_user = _env("SS14_WD_FS_USER") or _env("SS14_WD_USER") or "ss14"
         wd_fs_group = _env("SS14_WD_FS_GROUP") or _env("SS14_WD_GROUP") or wd_fs_user
 
@@ -1113,7 +1043,6 @@ class AgentRuntime:
         created_inst_dir = False
         created_frag = False
         try:
-            runtime_root.mkdir(parents=True, exist_ok=True)
             instances_dir.mkdir(parents=True, exist_ok=True)
             fragments_dir.mkdir(parents=True, exist_ok=True)
             inst_dir.mkdir(parents=True, exist_ok=False)
@@ -1130,8 +1059,8 @@ class AgentRuntime:
                     "    Override:\n"
                     "      SS14: Debug\n"
                     "      Microsoft: Warning\n\n"
-                    f"Urls: \"http://127.0.0.1:{wd_api_port}\"\n"
-                    f"BaseUrl: \"http://127.0.0.1:{wd_api_port}/\"\n\n"
+                    "Urls: \"http://127.0.0.1:13000\"\n"
+                    "BaseUrl: \"http://127.0.0.1:13000/\"\n\n"
                     "Process:\n"
                     "  PersistServers: true\n\n"
                     "Servers:\n"
@@ -1139,15 +1068,11 @@ class AgentRuntime:
                     encoding="utf-8",
                 )
             self._embedded_rebuild_appsettings(appsettings_base, appsettings_out, fragments_dir)
-            self._embedded_fix_ownership(runtime_root, wd_fs_user, wd_fs_group)
-            unit_name, unit_path = self._embedded_write_slug_watchdog_unit(
-                slug=slug,
-                runtime_root=runtime_root,
-                source_root=source_root,
-                service_user=wd_fs_user,
-                service_group=wd_fs_group,
-            )
-            self._embedded_enable_and_restart_unit(unit_name)
+            self._embedded_fix_ownership(inst_dir, wd_fs_user, wd_fs_group)
+            self._embedded_fix_ownership(fragments_dir, wd_fs_user, wd_fs_group, recursive=False)
+            self._embedded_fix_ownership(instances_dir, wd_fs_user, wd_fs_group, recursive=False)
+            restarted_service = self._embedded_restart_watchdog(watchdog_service)
+            update_result = self._embedded_notify_watchdog_update(watchdog_url, slug, api_token)
             return True, {
                 "mode": "embedded",
                 "slug": slug,
@@ -1157,10 +1082,8 @@ class AgentRuntime:
                 "dir_path": str(inst_dir),
                 "fragment_path": str(frag_file),
                 "token": api_token,
-                "watchdog_service": unit_name,
-                "watchdog_unit_path": str(unit_path),
-                "watchdog_runtime_root": str(runtime_root),
-                "watchdog_url": watchdog_url,
+                "watchdog_service": restarted_service,
+                "watchdog_update": update_result,
             }, None
         except Exception as exc:
             try:
@@ -1169,8 +1092,8 @@ class AgentRuntime:
             except Exception:
                 pass
             try:
-                if runtime_root.exists():
-                    shutil.rmtree(runtime_root, ignore_errors=True)
+                if created_inst_dir and inst_dir.exists():
+                    shutil.rmtree(inst_dir, ignore_errors=True)
             except Exception:
                 pass
             return False, {"mode": "embedded", "slug": slug}, f"embedded create-slug failed: {exc}"
