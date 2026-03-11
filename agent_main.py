@@ -1009,7 +1009,62 @@ class AgentRuntime:
             ordered.append(normalized)
         return ordered
 
-    def _embedded_restart_watchdog(self, service_name: str) -> str:
+    def _embedded_find_watchdog_command(self, wd_root: Path) -> list[str]:
+        candidates = [
+            wd_root / "SS14.Watchdog",
+            wd_root / "SS14.Watchdog.dll",
+            wd_root / "bin" / "SS14.Watchdog",
+            wd_root / "bin" / "SS14.Watchdog.dll",
+        ]
+        try:
+            candidates.extend(wd_root.rglob("SS14.Watchdog"))
+            candidates.extend(wd_root.rglob("SS14.Watchdog.dll"))
+        except Exception:
+            pass
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                path = candidate.resolve()
+            except Exception:
+                path = candidate
+            key = str(path)
+            if key in seen or not path.exists():
+                continue
+            seen.add(key)
+            if path.name.endswith(".dll"):
+                return ["dotnet", str(path)]
+            if os.access(path, os.X_OK):
+                return [str(path)]
+        raise RuntimeError(f"SS14.Watchdog executable not found under {wd_root}")
+
+    def _embedded_bootstrap_watchdog_service(self, service_name: str, wd_root: Path, user: str, group: str) -> str:
+        unit_name = str(service_name or "").strip() or "ss14-watchdog.service"
+        if not unit_name.endswith(".service"):
+            unit_name = f"{unit_name}.service"
+        exec_parts = self._embedded_find_watchdog_command(wd_root)
+        exec_start = " ".join(shlex.quote(part) for part in exec_parts)
+        unit_path = Path("/etc/systemd/system") / unit_name
+        unit_body = (
+            "[Unit]\n"
+            "Description=SS14 Watchdog\n"
+            "After=network.target\n\n"
+            "[Service]\n"
+            "Type=simple\n"
+            f"WorkingDirectory={wd_root}\n"
+            f"ExecStart={exec_start}\n"
+            f"User={user}\n"
+            f"Group={group}\n"
+            "Restart=always\n"
+            "RestartSec=5\n\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+        )
+        unit_path.write_text(unit_body, encoding="utf-8")
+        subprocess.run(["systemctl", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=20)
+        subprocess.run(["systemctl", "enable", unit_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=20)
+        return unit_name
+
+    def _embedded_restart_watchdog(self, service_name: str, wd_root: Path, user: str, group: str) -> str:
         errors: list[str] = []
         for candidate in self._embedded_guess_watchdog_services(service_name):
             proc = subprocess.run(
@@ -1023,6 +1078,19 @@ class AgentRuntime:
             if proc.returncode == 0:
                 return candidate
             errors.append(f"{candidate}: rc={proc.returncode} {(proc.stderr or '').strip()}")
+        if errors and all("not found" in err.lower() or "could not be found" in err.lower() for err in errors):
+            bootstrapped = self._embedded_bootstrap_watchdog_service(service_name, wd_root, user, group)
+            proc = subprocess.run(
+                ["systemctl", "restart", bootstrapped],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return bootstrapped
+            errors.append(f"{bootstrapped}: rc={proc.returncode} {(proc.stderr or '').strip()}")
         raise RuntimeError("watchdog restart failed; tried: " + " | ".join(errors[-4:]))
 
     def _embedded_notify_watchdog_update(self, watchdog_url: str, slug: str, api_token: str) -> dict[str, Any]:
@@ -1167,7 +1235,7 @@ class AgentRuntime:
             self._embedded_fix_ownership(inst_dir, wd_fs_user, wd_fs_group)
             self._embedded_fix_ownership(fragments_dir, wd_fs_user, wd_fs_group, recursive=False)
             self._embedded_fix_ownership(instances_dir, wd_fs_user, wd_fs_group, recursive=False)
-            restarted_service = self._embedded_restart_watchdog(watchdog_service)
+            restarted_service = self._embedded_restart_watchdog(watchdog_service, wd_root, wd_fs_user, wd_fs_group)
             update_result = self._embedded_notify_watchdog_update(watchdog_url, slug, api_token)
             return True, {
                 "mode": "embedded",
