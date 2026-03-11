@@ -888,6 +888,7 @@ class AgentRuntime:
     def _embedded_guess_watchdog_services(self, service_name: str) -> list[str]:
         candidates: list[str] = []
         explicit = str(service_name or "").strip()
+        wd_root = str((_env("SS14_WD_ROOT", "/opt/ss14/wds/watchdog") or "/opt/ss14/wds/watchdog")).strip().lower()
         if explicit:
             candidates.append(explicit)
             if not explicit.endswith(".service"):
@@ -912,6 +913,89 @@ class AgentRuntime:
                 name = line.strip().split(None, 1)[0]
                 low = name.lower()
                 if "watchdog" in low and "ss14" in low:
+                    candidates.append(name)
+        except Exception:
+            pass
+        discovered: list[str] = []
+        for candidate in list(candidates):
+            normalized = candidate.strip()
+            if not normalized:
+                continue
+            try:
+                proc = subprocess.run(
+                    [
+                        "systemctl",
+                        "show",
+                        normalized,
+                        "--no-pager",
+                        "--property=Id,Names,Description,FragmentPath,ExecStart",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+            except Exception:
+                continue
+            if proc.returncode != 0:
+                continue
+            text = (proc.stdout or "").strip()
+            if not text:
+                continue
+            low = text.lower()
+            if (
+                "ss14.watchdog" in low
+                or (wd_root and wd_root in low)
+                or ("/opt/ss14" in low and "watchdog" in low)
+            ):
+                discovered.append(normalized)
+                continue
+            names: list[str] = []
+            for line in text.splitlines():
+                if line.startswith("Names="):
+                    names.extend(part.strip() for part in line.split("=", 1)[1].split() if part.strip())
+            for name in names:
+                name_low = name.lower()
+                if "watchdog" in name_low and ("ss14" in name_low or "/opt/ss14" in low):
+                    discovered.append(name)
+        candidates.extend(discovered)
+        try:
+            proc = subprocess.run(
+                ["systemctl", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            for line in (proc.stdout or "").splitlines():
+                name = line.strip().split(None, 1)[0]
+                if not name:
+                    continue
+                try:
+                    meta = subprocess.run(
+                        [
+                            "systemctl",
+                            "show",
+                            name,
+                            "--no-pager",
+                            "--property=Description,FragmentPath,ExecStart",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                    )
+                except Exception:
+                    continue
+                low = ((meta.stdout or "") + "\n" + name).lower()
+                if (
+                    "watchdog" in low
+                    and (
+                        "ss14.watchdog" in low
+                        or (wd_root and wd_root in low)
+                        or "/opt/ss14" in low
+                    )
+                ):
                     candidates.append(name)
         except Exception:
             pass
