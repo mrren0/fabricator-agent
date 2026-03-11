@@ -1240,6 +1240,36 @@ class AgentRuntime:
             errors.append(f"{bootstrapped}: rc={proc.returncode} {(proc.stderr or '').strip()}")
         raise RuntimeError("watchdog restart failed; tried: " + " | ".join(errors[-4:]))
 
+    def _embedded_watchdog_failure_context(self, service_name: str) -> str:
+        parts: list[str] = []
+        try:
+            proc = subprocess.run(
+                ["systemctl", "status", service_name, "--no-pager", "--full"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            status_tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[-self.output_tail_chars :]
+            if status_tail:
+                parts.append(f"systemctl: {status_tail}")
+        except Exception:
+            pass
+        try:
+            proc = subprocess.run(
+                ["journalctl", "-u", service_name, "-n", "80", "--no-pager"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            journal_tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[-self.output_tail_chars :]
+            if journal_tail:
+                parts.append(f"journal: {journal_tail}")
+        except Exception:
+            pass
+        return " | ".join(parts)
+
     def _embedded_wait_watchdog_api(self, watchdog_url: str, service_name: str) -> None:
         try:
             parsed = urlparse(watchdog_url)
@@ -1256,55 +1286,43 @@ class AgentRuntime:
             except OSError as exc:
                 last_error = str(exc)
                 time.sleep(1.0)
-        status_tail = ""
-        journal_tail = ""
-        try:
-            proc = subprocess.run(
-                ["systemctl", "status", service_name, "--no-pager", "--full"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-            status_tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[-self.output_tail_chars :]
-        except Exception:
-            status_tail = ""
-        try:
-            proc = subprocess.run(
-                ["journalctl", "-u", service_name, "-n", "80", "--no-pager"],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-            journal_tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[-self.output_tail_chars :]
-        except Exception:
-            journal_tail = ""
         parts = [f"watchdog API did not become ready at {watchdog_url}"]
         if last_error:
             parts.append(last_error)
-        if status_tail:
-            parts.append(f"systemctl: {status_tail}")
-        if journal_tail:
-            parts.append(f"journal: {journal_tail}")
+        context = self._embedded_watchdog_failure_context(service_name)
+        if context:
+            parts.append(context)
         raise RuntimeError(" | ".join(parts))
 
-    def _embedded_notify_watchdog_update(self, watchdog_url: str, slug: str, api_token: str) -> dict[str, Any]:
+    def _embedded_notify_watchdog_update(self, watchdog_url: str, slug: str, api_token: str, service_name: str) -> dict[str, Any]:
         try:
             parsed = urlparse(watchdog_url)
             if parsed.scheme and parsed.netloc:
                 watchdog_url = f"{parsed.scheme}://{parsed.netloc}"
         except Exception:
             watchdog_url = watchdog_url.rstrip("/")
-        res = requests.post(
-            f"{watchdog_url.rstrip('/')}/instances/{slug}/update",
-            auth=(slug, api_token),
-            timeout=max(5, self.timeout),
-        )
-        return {
-            "status_code": res.status_code,
-            "body_tail": (res.text or "")[-self.output_tail_chars :],
-        }
+        last_error = ""
+        for _ in range(max(1, int(_env("SS14_WD_UPDATE_RETRIES", "5") or "5"))):
+            try:
+                res = requests.post(
+                    f"{watchdog_url.rstrip('/')}/instances/{slug}/update",
+                    auth=(slug, api_token),
+                    timeout=max(5, self.timeout),
+                )
+                return {
+                    "status_code": res.status_code,
+                    "body_tail": (res.text or "")[-self.output_tail_chars :],
+                }
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                time.sleep(1.0)
+        context = self._embedded_watchdog_failure_context(service_name)
+        message = f"watchdog update failed at {watchdog_url.rstrip('/')}/instances/{slug}/update"
+        if last_error:
+            message += f": {last_error}"
+        if context:
+            message += f" | {context}"
+        raise RuntimeError(message)
 
     def _embedded_create_slug(self, body: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
         slug = str(body.get("slug") or "").strip().lower()
@@ -1433,7 +1451,7 @@ class AgentRuntime:
             self._embedded_fix_ownership(instances_dir, wd_fs_user, wd_fs_group, recursive=False)
             restarted_service = self._embedded_restart_watchdog(watchdog_service, wd_root, wd_fs_user, wd_fs_group)
             self._embedded_wait_watchdog_api(watchdog_url, restarted_service)
-            update_result = self._embedded_notify_watchdog_update(watchdog_url, slug, api_token)
+            update_result = self._embedded_notify_watchdog_update(watchdog_url, slug, api_token, restarted_service)
             return True, {
                 "mode": "embedded",
                 "slug": slug,
