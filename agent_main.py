@@ -1676,6 +1676,7 @@ class AgentRuntime:
         api_token = secrets.token_hex(8)
         server_url = _build_server_url(public_host, slug, port)
         udp_host = public_host or "127.0.0.1"
+        loki_host = _normalize_host(_env("AGENT_LOKI_HOST") or "") or public_host or "127.0.0.1"
         config_content = (
             f"[net]\n"
             f"tickrate = 30\n"
@@ -1705,7 +1706,7 @@ class AgentRuntime:
             f"name = \"{slug}\"\n"
             f"username = \"{slug}\"\n"
             f"password = \"{api_token}\"\n"
-            f"address = \"http://127.0.0.1:3100\"\n"
+            f"address = \"http://{loki_host}:3100\"\n"
             f"enabled = true\n\n"
             f"[watchdog]\n"
             f"token = \"{api_token}\"\n\n"
