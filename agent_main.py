@@ -788,17 +788,21 @@ class AgentRuntime:
             None,
         )
 
+    def _embedded_pick_port(self, *, start: int, stop: int, used_ports: set[int], error_message: str) -> int:
+        first = max(1, int(start))
+        for port in range(first, int(stop) + 1):
+            if port in used_ports:
+                continue
+            if self._embedded_is_port_free(port):
+                return port
+        raise RuntimeError(error_message)
+
     def _embedded_allocate_port(self, requested_port: int, instances_dir: Path, fragments_dir: Path) -> int:
         try:
             port_min = int(_env("SS14_PORT_MIN", "1212") or "1212")
             port_max = int(_env("SS14_PORT_MAX", "2211") or "2211")
         except Exception as exc:
             raise RuntimeError(f"invalid SS14_PORT_MIN/SS14_PORT_MAX: {exc}")
-
-        if requested_port not in (0, 1):
-            if not self._embedded_is_port_free(requested_port):
-                raise RuntimeError(f"Port {requested_port} is already in use")
-            return requested_port
 
         used_ports: set[int] = set()
         for cfg_file in instances_dir.glob("*/config.toml"):
@@ -819,14 +823,21 @@ class AgentRuntime:
                         break
             except Exception:
                 continue
-        for port in range(port_min, port_max + 1):
-            if port in used_ports:
-                continue
-            if self._embedded_is_port_free(port):
-                return port
-        raise RuntimeError(f"No free ports available in range {port_min}..{port_max}")
+        start = requested_port if requested_port not in (0, 1) else port_min
+        return self._embedded_pick_port(
+            start=max(int(start), port_min),
+            stop=port_max,
+            used_ports=used_ports,
+            error_message=f"No free ports available in range {max(int(start), port_min)}..{port_max}",
+        )
 
-    def _embedded_allocate_watchdog_port(self, requested_port: int, dedicated_base: Path, template_root: Path) -> int:
+    def _embedded_allocate_watchdog_port(
+        self,
+        requested_port: int,
+        dedicated_base: Path,
+        template_root: Path,
+        forbidden_ports: set[int] | None = None,
+    ) -> int:
         try:
             port_min = int(_env("SS14_WD_PORT_MIN", "8000") or "8000")
             port_max = int(_env("SS14_WD_PORT_MAX", "8999") or "8999")
@@ -850,18 +861,16 @@ class AgentRuntime:
                                 used_ports.add(int(parsed.port))
                         except Exception:
                             continue
+        if forbidden_ports:
+            used_ports.update(int(port) for port in forbidden_ports if int(port) > 0)
 
-        if requested_port not in (0, 1):
-            if requested_port in used_ports or not self._embedded_is_port_free(requested_port):
-                raise RuntimeError(f"Watchdog port {requested_port} is already in use")
-            return requested_port
-
-        for port in range(port_min, port_max + 1):
-            if port in used_ports:
-                continue
-            if self._embedded_is_port_free(port):
-                return port
-        raise RuntimeError(f"No free watchdog ports available in range {port_min}..{port_max}")
+        start = requested_port if requested_port not in (0, 1) else port_min
+        return self._embedded_pick_port(
+            start=max(int(start), port_min),
+            stop=port_max,
+            used_ports=used_ports,
+            error_message=f"No free watchdog ports available in range {max(int(start), port_min)}..{port_max}",
+        )
 
     def _embedded_is_port_free(self, port: int) -> bool:
         def _try_bind(fam: int, typ: int, addr: str) -> bool:
@@ -1564,14 +1573,6 @@ class AgentRuntime:
             explicit_watchdog_port = int(body.get("watchdog_port") or 0)
         except Exception:
             return False, {}, "watchdog_port must be an integer"
-        try:
-            watchdog_port = self._embedded_allocate_watchdog_port(explicit_watchdog_port, dedicated_base, template_root)
-        except Exception as exc:
-            return False, {}, str(exc)
-        watchdog_url = f"http://127.0.0.1:{int(watchdog_port)}"
-        watchdog_service = _env("SS14_WD_SYSTEMD_SERVICE", f"SS14.Watchdog-{slug}") or f"SS14.Watchdog-{slug}"
-        wd_fs_user = _env("SS14_WD_FS_USER") or _env("SS14_WD_USER") or "ss14"
-        wd_fs_group = _env("SS14_WD_FS_GROUP") or _env("SS14_WD_GROUP") or wd_fs_user
 
         try:
             explicit_port = int(body.get("port") or 1)
@@ -1584,6 +1585,19 @@ class AgentRuntime:
             port = self._embedded_allocate_port(explicit_port, legacy_instances_dir, legacy_fragments_dir)
         except Exception as exc:
             return False, {}, str(exc)
+        try:
+            watchdog_port = self._embedded_allocate_watchdog_port(
+                explicit_watchdog_port,
+                dedicated_base,
+                template_root,
+                {port},
+            )
+        except Exception as exc:
+            return False, {}, str(exc)
+        watchdog_url = f"http://127.0.0.1:{int(watchdog_port)}"
+        watchdog_service = _env("SS14_WD_SYSTEMD_SERVICE", f"SS14.Watchdog-{slug}") or f"SS14.Watchdog-{slug}"
+        wd_fs_user = _env("SS14_WD_FS_USER") or _env("SS14_WD_USER") or "ss14"
+        wd_fs_group = _env("SS14_WD_FS_GROUP") or _env("SS14_WD_GROUP") or wd_fs_user
 
         if wd_root.exists():
             return False, {"watchdog_root": str(wd_root)}, f"Watchdog root for instance '{slug}' already exists"
