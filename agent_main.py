@@ -272,6 +272,8 @@ class AgentRuntime:
         self.token_file = Path(_env("AGENT_TOKEN_FILE", "/opt/fabricator-agent/agent.token") or "/opt/fabricator-agent/agent.token")
         self.poll_seconds = int(_env("AGENT_POLL_SECONDS", "10") or "10")
         self.timeout = int(_env("AGENT_HTTP_TIMEOUT_SECONDS", "10") or "10")
+        self.instruction_wait_seconds = max(0, int(_env("AGENT_INSTRUCTION_WAIT_SECONDS", "25") or "25"))
+        self.heartbeat_seconds = max(5, int(_env("AGENT_HEARTBEAT_SECONDS", "30") or "30"))
         self.runtime_post_retries = max(1, int(_env("AGENT_RUNTIME_POST_RETRIES", "3") or "3"))
         self.runtime_post_retry_delay = max(
             0.1,
@@ -296,6 +298,7 @@ class AgentRuntime:
             "last_instruction_ok": None,
             "last_instruction_error": None,
             "last_instruction_result": None,
+            "last_pull_next_poll_seconds": None,
             "config_sha256": None,
             "claim_code": None,
             "paired": False,
@@ -305,6 +308,7 @@ class AgentRuntime:
             "last_diagnostic_ok": None,
             "mode": "test-local" if self.test_mode else "runtime",
         }
+        self._next_heartbeat_at = 0.0
         self._load_token_file()
 
     @staticmethod
@@ -427,7 +431,12 @@ class AgentRuntime:
         self.status["last_register_at"] = time.time()
         self.status["config_sha256"] = cfg_sha
 
+    def _heartbeat_due(self) -> bool:
+        return time.time() >= float(self._next_heartbeat_at or 0.0)
+
     def _heartbeat(self, cfg_sha: str | None) -> None:
+        now = time.time()
+        self._next_heartbeat_at = now + float(self.heartbeat_seconds)
         if self.agent_token:
             payload = {
                 "status": "ok",
@@ -489,44 +498,50 @@ class AgentRuntime:
         res.raise_for_status()
         self.status["last_heartbeat_at"] = time.time()
 
-    def _pull(self) -> list[dict[str, Any]]:
+    def _pull(self) -> tuple[list[dict[str, Any]], float]:
+        request_timeout = max(self.timeout, self.instruction_wait_seconds + 5)
+        wait_seconds = max(0, int(self.instruction_wait_seconds))
         if self.agent_token:
             res = requests.get(
                 f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions",
-                params={"limit": 25},
+                params={"limit": 25, "wait_seconds": wait_seconds},
                 headers=self._runtime_headers(),
-                timeout=self.timeout,
+                timeout=request_timeout,
             )
             if res.status_code == 401:
                 self._invalidate_runtime_token("Runtime token rejected while pulling; re-enrolling")
-                return []
+                return [], float(self.poll_seconds)
             res.raise_for_status()
             data = res.json() if res.content else {}
             self.status["last_pull_at"] = time.time()
             items = data.get("instructions") or []
             self.status["last_instruction_count"] = len(items)
-            return items
+            next_poll_seconds = float(data.get("next_poll_seconds") or 0)
+            self.status["last_pull_next_poll_seconds"] = next_poll_seconds
+            return items, next_poll_seconds
 
         # Legacy mode: pull is available only with AGENT_API_TOKEN/SS14_API_TOKEN.
         if not self.api_token or self._legacy_auth_disabled:
-            return []
+            return [], float(self.poll_seconds)
 
         res = requests.get(
             f"{self.backend_url}/api/agent/instructions/{self.agent_id}",
-            params={"limit": 25},
+            params={"limit": 25, "wait_seconds": wait_seconds},
             headers=self._headers(),
-            timeout=self.timeout,
+            timeout=request_timeout,
         )
         if res.status_code == 401:
             self._legacy_auth_disabled = True
             self.status["legacy_auth_disabled"] = True
-            return []
+            return [], float(self.poll_seconds)
         res.raise_for_status()
         data = res.json() if res.content else {}
         self.status["last_pull_at"] = time.time()
         items = data.get("instructions") or []
         self.status["last_instruction_count"] = len(items)
-        return items
+        next_poll_seconds = float(data.get("next_poll_seconds") or 0)
+        self.status["last_pull_next_poll_seconds"] = next_poll_seconds
+        return items, next_poll_seconds
 
     def _ack(self, instruction_id: str, ok: bool, result: dict[str, Any] | None = None, error: str | None = None) -> None:
         payload = {"ok": bool(ok), "result": result or {}, "error": error}
@@ -1999,6 +2014,7 @@ class AgentRuntime:
     def loop(self) -> None:
         while not self._stop.is_set():
             cycle_error: str | None = None
+            sleep_seconds = float(self.poll_seconds)
             try:
                 if not self.agent_token:
                     if not self.status.get("claim_code"):
@@ -2015,9 +2031,11 @@ class AgentRuntime:
                 ):
                     # Re-register when config changed.
                     self._register(cfg, cfg_sha)
-                self._heartbeat(cfg_sha)
-                items = self._pull()
+                if self._heartbeat_due():
+                    self._heartbeat(cfg_sha)
+                items, next_poll_seconds = self._pull()
                 self.status["last_instruction_count"] = len(items)
+                sleep_seconds = float(next_poll_seconds if not items else 0.0)
                 for item in items:
                     instruction_id = str(item.get("id") or "")
                     instruction_kind = str(item.get("kind") or "").strip().lower() or None
@@ -2084,7 +2102,8 @@ class AgentRuntime:
                     self.status["last_error"] = f"{response.status_code} {response.reason}: {request_url or ''}".strip()
                 else:
                     self.status["last_error"] = str(exc)
-            self._stop.wait(self.poll_seconds)
+                sleep_seconds = float(self.poll_seconds)
+            self._stop.wait(max(0.0, sleep_seconds))
 
     def start(self) -> None:
         if self.test_mode:
@@ -2143,6 +2162,8 @@ def status() -> dict[str, Any]:
         "agent_id": runtime.agent_id,
         "backend_url": runtime.backend_url,
         "poll_seconds": runtime.poll_seconds,
+        "instruction_wait_seconds": runtime.instruction_wait_seconds,
+        "heartbeat_seconds": runtime.heartbeat_seconds,
         "runtime_pid": os.getpid(),
         "http_port": http_port,
         "config_path": str(runtime.config_path),
