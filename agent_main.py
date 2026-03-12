@@ -924,7 +924,16 @@ class AgentRuntime:
             except Exception:
                 pass
 
+    def _embedded_service_account_home(self, wd_root: Path) -> Path:
+        default_home = wd_root.parent / ".service-account"
+        return Path(_env("SS14_WD_ACCOUNT_HOME", str(default_home)) or str(default_home))
+
     def _embedded_ensure_service_account(self, user: str, group: str, home: Path) -> None:
+        service_home = self._embedded_service_account_home(home)
+        try:
+            service_home.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         try:
             grp.getgrnam(group)
         except KeyError:
@@ -936,7 +945,7 @@ class AgentRuntime:
                 timeout=20,
             )
         try:
-            pwd.getpwnam(user)
+            existing = pwd.getpwnam(user)
         except KeyError:
             subprocess.run(
                 [
@@ -944,7 +953,7 @@ class AgentRuntime:
                     "--system",
                     "--no-create-home",
                     "--home-dir",
-                    str(home),
+                    str(service_home),
                     "--shell",
                     "/usr/sbin/nologin",
                     "--gid",
@@ -956,6 +965,17 @@ class AgentRuntime:
                 check=False,
                 timeout=20,
             )
+        else:
+            current_home = str(getattr(existing, "pw_dir", "") or "").strip()
+            if current_home and current_home != str(service_home):
+                subprocess.run(
+                    ["usermod", "--home", str(service_home), user],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=20,
+                )
+        self._embedded_fix_ownership(service_home, user, group, recursive=False)
 
     def _embedded_guess_watchdog_services(self, service_name: str) -> list[str]:
         candidates: list[str] = []
@@ -1314,6 +1334,17 @@ class AgentRuntime:
             exec_parts = self._embedded_find_watchdog_command(wd_root)
         except RuntimeError:
             exec_parts = self._embedded_install_watchdog(wd_root)
+        service_home = self._embedded_service_account_home(wd_root)
+        dotnet_cli_home = service_home / ".dotnet"
+        nuget_packages = service_home / ".nuget" / "packages"
+        xdg_data_home = service_home / ".local" / "share"
+        xdg_cache_home = service_home / ".cache"
+        for path in (service_home, dotnet_cli_home, nuget_packages, xdg_data_home, xdg_cache_home):
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            self._embedded_fix_ownership(path, user, group, recursive=False)
         dotnet_root = ""
         if exec_parts:
             first = Path(exec_parts[0])
@@ -1334,6 +1365,16 @@ class AgentRuntime:
                 f"Environment=DOTNET_ROOT={dotnet_root}\n"
                 f"Environment=DOTNET_ROOT_X64={dotnet_root}\n"
             )
+        env_block += (
+            f"Environment=HOME={service_home}\n"
+            f"Environment=DOTNET_CLI_HOME={dotnet_cli_home}\n"
+            f"Environment=NUGET_PACKAGES={nuget_packages}\n"
+            f"Environment=XDG_DATA_HOME={xdg_data_home}\n"
+            f"Environment=XDG_CACHE_HOME={xdg_cache_home}\n"
+            "Environment=DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1\n"
+            "Environment=DOTNET_CLI_TELEMETRY_OPTOUT=1\n"
+            "Environment=DOTNET_NOLOGO=1\n"
+        )
         unit_path = Path("/etc/systemd/system") / unit_name
         unit_body = (
             "[Unit]\n"
