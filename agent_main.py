@@ -13,6 +13,7 @@ import logging
 import os
 import pwd
 import grp
+import re
 import secrets
 import shlex
 import shutil
@@ -917,6 +918,70 @@ class AgentRuntime:
             for frag in sorted(fragments_dir.glob("*.yml")):
                 fp.write(frag.read_text(encoding="utf-8"))
         tmp.replace(appsettings_out)
+
+    def _embedded_watchdog_layout(self, slug: str) -> tuple[Path, Path, Path]:
+        template_root = Path(_env("SS14_WD_ROOT", "/opt/ss14/wds/watchdog") or "/opt/ss14/wds/watchdog")
+        dedicated_base = Path(
+            _env(
+                "SS14_WD_DEDICATED_BASE",
+                str(template_root.parent.parent if template_root.parent.name == "wds" else template_root.parent),
+            )
+            or str(template_root.parent.parent if template_root.parent.name == "wds" else template_root.parent)
+        )
+        wd_root = dedicated_base / f"{template_root.name}-{slug}"
+        return template_root, dedicated_base, wd_root
+
+    def _embedded_instance_config_path(self, slug: str) -> Path:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            raise ValueError("payload.slug is required")
+        template_root, _, wd_root = self._embedded_watchdog_layout(slug_norm)
+        dedicated_cfg = wd_root / "instances" / slug_norm / "config.toml"
+        legacy_cfg = template_root / "instances" / slug_norm / "config.toml"
+        if dedicated_cfg.exists():
+            return dedicated_cfg
+        if legacy_cfg.exists():
+            return legacy_cfg
+        raise ValueError(f"config.toml for '{slug_norm}' does not exist")
+
+    def _embedded_config_contains_slug(self, slug: str, content: str) -> bool:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            return False
+        pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(slug_norm)}(?![A-Za-z0-9])", re.IGNORECASE)
+        return bool(pattern.search(content or ""))
+
+    def _embedded_get_instance_config(self, slug: str) -> tuple[bool, dict[str, Any], str | None]:
+        try:
+            cfg_path = self._embedded_instance_config_path(slug)
+            content = cfg_path.read_text(encoding="utf-8", errors="ignore")
+            return True, {"slug": str(slug or "").strip().lower(), "content": content}, None
+        except ValueError as exc:
+            return False, {"status_code": 404}, str(exc)
+        except Exception as exc:
+            return False, {}, str(exc)
+
+    def _embedded_set_instance_config(self, slug: str, content: str) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        text = content if content is not None else ""
+        if not text.strip():
+            return False, {"status_code": 400}, "content is empty"
+        if not self._embedded_config_contains_slug(slug_norm, text):
+            return False, {"status_code": 400}, f"config must contain instance slug '{slug_norm}' (case-insensitive)"
+        try:
+            cfg_path = self._embedded_instance_config_path(slug_norm)
+        except ValueError as exc:
+            return False, {"status_code": 404}, str(exc)
+        try:
+            backup = cfg_path.with_suffix(".toml.bak")
+            try:
+                backup.write_text(cfg_path.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
+            except Exception:
+                pass
+            cfg_path.write_text(text, encoding="utf-8")
+            return True, {"slug": slug_norm, "status": "config_updated"}, None
+        except Exception as exc:
+            return False, {}, str(exc)
 
     def _embedded_fix_ownership(self, path: Path, user: str, group: str, recursive: bool = True) -> None:
         try:
@@ -1855,6 +1920,13 @@ class AgentRuntime:
             return self._run_self_update(payload if isinstance(payload, dict) else {})
         if kind == "create-slug":
             return self._run_create_slug(payload if isinstance(payload, dict) else {})
+        if kind == "get-instance-config":
+            return self._embedded_get_instance_config(str(payload.get("slug") or ""))
+        if kind == "set-instance-config":
+            return self._embedded_set_instance_config(
+                str(payload.get("slug") or ""),
+                str(payload.get("content") or ""),
+            )
         if kind in {
             "create-instance",
             "delete-instance",
