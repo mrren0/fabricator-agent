@@ -789,8 +789,8 @@ class AgentRuntime:
 
     def _embedded_allocate_port(self, requested_port: int, instances_dir: Path, fragments_dir: Path) -> int:
         try:
-            port_min = int(_env("SS14_PORT_MIN", "14000") or "14000")
-            port_max = int(_env("SS14_PORT_MAX", "14999") or "14999")
+            port_min = int(_env("SS14_PORT_MIN", "1212") or "1212")
+            port_max = int(_env("SS14_PORT_MAX", "2211") or "2211")
         except Exception as exc:
             raise RuntimeError(f"invalid SS14_PORT_MIN/SS14_PORT_MAX: {exc}")
 
@@ -824,6 +824,43 @@ class AgentRuntime:
             if self._embedded_is_port_free(port):
                 return port
         raise RuntimeError(f"No free ports available in range {port_min}..{port_max}")
+
+    def _embedded_allocate_watchdog_port(self, requested_port: int, dedicated_base: Path, template_root: Path) -> int:
+        try:
+            port_min = int(_env("SS14_WD_PORT_MIN", "8000") or "8000")
+            port_max = int(_env("SS14_WD_PORT_MAX", "8999") or "8999")
+        except Exception as exc:
+            raise RuntimeError(f"invalid SS14_WD_PORT_MIN/SS14_WD_PORT_MAX: {exc}")
+
+        used_ports: set[int] = set()
+        for root in [template_root, *sorted(dedicated_base.glob(f"{template_root.name}-*"))]:
+            for cfg_path in (root / "appsettings.base.yml", root / "appsettings.yml"):
+                try:
+                    text = cfg_path.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                for line in text.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("Urls:"):
+                        tail = stripped.split(":", 1)[1]
+                        try:
+                            parsed = urlparse(tail.strip().strip('"'))
+                            if parsed.port:
+                                used_ports.add(int(parsed.port))
+                        except Exception:
+                            continue
+
+        if requested_port not in (0, 1):
+            if requested_port in used_ports or not self._embedded_is_port_free(requested_port):
+                raise RuntimeError(f"Watchdog port {requested_port} is already in use")
+            return requested_port
+
+        for port in range(port_min, port_max + 1):
+            if port in used_ports:
+                continue
+            if self._embedded_is_port_free(port):
+                return port
+        raise RuntimeError(f"No free watchdog ports available in range {port_min}..{port_max}")
 
     def _embedded_is_port_free(self, port: int) -> bool:
         def _try_bind(fam: int, typ: int, addr: str) -> bool:
@@ -885,6 +922,39 @@ class AgentRuntime:
                 os.chown(target, uid, gid)
             except Exception:
                 pass
+
+    def _embedded_ensure_service_account(self, user: str, group: str, home: Path) -> None:
+        try:
+            grp.getgrnam(group)
+        except KeyError:
+            subprocess.run(
+                ["groupadd", "--system", group],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=20,
+            )
+        try:
+            pwd.getpwnam(user)
+        except KeyError:
+            subprocess.run(
+                [
+                    "useradd",
+                    "--system",
+                    "--no-create-home",
+                    "--home-dir",
+                    str(home),
+                    "--shell",
+                    "/usr/sbin/nologin",
+                    "--gid",
+                    group,
+                    user,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=20,
+            )
 
     def _embedded_guess_watchdog_services(self, service_name: str) -> list[str]:
         candidates: list[str] = []
@@ -1213,6 +1283,27 @@ class AgentRuntime:
 
     def _embedded_restart_watchdog(self, service_name: str, wd_root: Path, user: str, group: str) -> str:
         errors: list[str] = []
+        explicit = str(service_name or "").strip()
+        legacy_names = {
+            "SS14.Watchdog",
+            "SS14.Watchdog.service",
+            "ss14-watchdog",
+            "ss14-watchdog.service",
+        }
+        if explicit and explicit not in legacy_names:
+            bootstrapped = self._embedded_bootstrap_watchdog_service(explicit, wd_root, user, group)
+            proc = subprocess.run(
+                ["systemctl", "restart", bootstrapped],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return bootstrapped
+            errors.append(f"{bootstrapped}: rc={proc.returncode} {(proc.stderr or '').strip()}")
+            raise RuntimeError("watchdog restart failed; tried: " + " | ".join(errors[-4:]))
         for candidate in self._embedded_guess_watchdog_services(service_name):
             proc = subprocess.run(
                 ["systemctl", "restart", candidate],
@@ -1276,7 +1367,7 @@ class AgentRuntime:
             host = parsed.hostname or "127.0.0.1"
             port = int(parsed.port or (443 if parsed.scheme == "https" else 80))
         except Exception:
-            host, port = "127.0.0.1", 13000
+            host, port = "127.0.0.1", 8000
         deadline = time.time() + max(5, int(_env("SS14_WD_READY_TIMEOUT_SECONDS", "25") or "25"))
         last_error = ""
         while time.time() < deadline:
@@ -1338,15 +1429,31 @@ class AgentRuntime:
         if not (3 <= len(slug) <= 64 and all(ch in "abcdefghijklmnopqrstuvwxyz0123456789_-" for ch in slug)):
             return False, {}, "Slug must be 3..64 characters of a-z, 0-9, '-' or '_'"
 
-        wd_root = Path(_env("SS14_WD_ROOT", "/opt/ss14/wds/watchdog") or "/opt/ss14/wds/watchdog")
+        template_root = Path(_env("SS14_WD_ROOT", "/opt/ss14/wds/watchdog") or "/opt/ss14/wds/watchdog")
+        dedicated_base = Path(
+            _env(
+                "SS14_WD_DEDICATED_BASE",
+                str(template_root.parent.parent if template_root.parent.name == "wds" else template_root.parent),
+            )
+            or str(template_root.parent.parent if template_root.parent.name == "wds" else template_root.parent)
+        )
+        wd_root = dedicated_base / f"{template_root.name}-{slug}"
         instances_dir = wd_root / "instances"
         fragments_dir = wd_root / "instances.d"
         appsettings_base = wd_root / "appsettings.base.yml"
         appsettings_out = wd_root / "appsettings.yml"
         inst_dir = instances_dir / slug
         frag_file = fragments_dir / f"{slug}.yml"
-        watchdog_url = (_env("SS14_WD_URL", "http://127.0.0.1:13000") or "http://127.0.0.1:13000").rstrip("/")
-        watchdog_service = _env("SS14_WD_SYSTEMD_SERVICE", "SS14.Watchdog") or "SS14.Watchdog"
+        try:
+            explicit_watchdog_port = int(body.get("watchdog_port") or 0)
+        except Exception:
+            return False, {}, "watchdog_port must be an integer"
+        try:
+            watchdog_port = self._embedded_allocate_watchdog_port(explicit_watchdog_port, dedicated_base, template_root)
+        except Exception as exc:
+            return False, {}, str(exc)
+        watchdog_url = f"http://127.0.0.1:{int(watchdog_port)}"
+        watchdog_service = _env("SS14_WD_SYSTEMD_SERVICE", f"SS14.Watchdog-{slug}") or f"SS14.Watchdog-{slug}"
         wd_fs_user = _env("SS14_WD_FS_USER") or _env("SS14_WD_USER") or "ss14"
         wd_fs_group = _env("SS14_WD_FS_GROUP") or _env("SS14_WD_GROUP") or wd_fs_user
 
@@ -1356,10 +1463,14 @@ class AgentRuntime:
             return False, {}, "Port must be an integer"
 
         try:
-            port = self._embedded_allocate_port(explicit_port, instances_dir, fragments_dir)
+            legacy_instances_dir = template_root / "instances"
+            legacy_fragments_dir = template_root / "instances.d"
+            port = self._embedded_allocate_port(explicit_port, legacy_instances_dir, legacy_fragments_dir)
         except Exception as exc:
             return False, {}, str(exc)
 
+        if wd_root.exists():
+            return False, {"watchdog_root": str(wd_root)}, f"Watchdog root for instance '{slug}' already exists"
         if inst_dir.exists():
             return False, {"dir_path": str(inst_dir)}, f"Directory for instance '{slug}' already exists"
         if frag_file.exists():
@@ -1421,6 +1532,8 @@ class AgentRuntime:
         created_inst_dir = False
         created_frag = False
         try:
+            self._embedded_ensure_service_account(wd_fs_user, wd_fs_group, wd_root)
+            wd_root.mkdir(parents=True, exist_ok=True)
             instances_dir.mkdir(parents=True, exist_ok=True)
             fragments_dir.mkdir(parents=True, exist_ok=True)
             inst_dir.mkdir(parents=True, exist_ok=False)
@@ -1429,23 +1542,23 @@ class AgentRuntime:
             frag_file.write_text(yaml_content, encoding="utf-8")
             created_frag = True
 
-            if not appsettings_base.exists():
-                appsettings_base.write_text(
-                    "Serilog:\n"
-                    "  MinimumLevel:\n"
-                    "    Default: Information\n"
-                    "    Override:\n"
-                    "      SS14: Debug\n"
-                    "      Microsoft: Warning\n\n"
-                    "Urls: \"http://127.0.0.1:13000\"\n"
-                    "BaseUrl: \"http://127.0.0.1:13000/\"\n\n"
-                    "Process:\n"
-                    "  PersistServers: true\n\n"
-                    "Servers:\n"
-                    "  Instances:\n",
-                    encoding="utf-8",
-                )
+            appsettings_base.write_text(
+                "Serilog:\n"
+                "  MinimumLevel:\n"
+                "    Default: Information\n"
+                "    Override:\n"
+                "      SS14: Debug\n"
+                "      Microsoft: Warning\n\n"
+                f"Urls: \"http://127.0.0.1:{int(watchdog_port)}\"\n"
+                f"BaseUrl: \"http://127.0.0.1:{int(watchdog_port)}/\"\n\n"
+                "Process:\n"
+                "  PersistServers: true\n\n"
+                "Servers:\n"
+                "  Instances:\n",
+                encoding="utf-8",
+            )
             self._embedded_rebuild_appsettings(appsettings_base, appsettings_out, fragments_dir)
+            self._embedded_fix_ownership(wd_root, wd_fs_user, wd_fs_group)
             self._embedded_fix_ownership(inst_dir, wd_fs_user, wd_fs_group)
             self._embedded_fix_ownership(fragments_dir, wd_fs_user, wd_fs_group, recursive=False)
             self._embedded_fix_ownership(instances_dir, wd_fs_user, wd_fs_group, recursive=False)
@@ -1461,6 +1574,8 @@ class AgentRuntime:
                 "dir_path": str(inst_dir),
                 "fragment_path": str(frag_file),
                 "token": api_token,
+                "watchdog_root": str(wd_root),
+                "watchdog_port": int(watchdog_port),
                 "watchdog_service": restarted_service,
                 "watchdog_update": update_result,
             }, None
@@ -1473,6 +1588,11 @@ class AgentRuntime:
             try:
                 if created_inst_dir and inst_dir.exists():
                     shutil.rmtree(inst_dir, ignore_errors=True)
+            except Exception:
+                pass
+            try:
+                if wd_root.exists():
+                    shutil.rmtree(wd_root, ignore_errors=True)
             except Exception:
                 pass
             return False, {"mode": "embedded", "slug": slug}, f"embedded create-slug failed: {exc}"
@@ -1491,6 +1611,7 @@ class AgentRuntime:
             env["FABRICATOR_REPO"] = str((body or {}).get("repo") or "")
             env["FABRICATOR_BRANCH"] = str((body or {}).get("branch") or "master")
             env["FABRICATOR_PORT"] = str(int((body or {}).get("port") or 1))
+            env["FABRICATOR_WATCHDOG_PORT"] = str(int((body or {}).get("watchdog_port") or 0))
             env["FABRICATOR_PUBLIC_HOST"] = str((body or {}).get("public_host") or "")
             env["FABRICATOR_HOST_USER"] = str((body or {}).get("host_user") or "")
             try:
