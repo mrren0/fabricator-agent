@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import logging
 import os
 import pwd
@@ -1124,24 +1125,79 @@ class AgentRuntime:
                 return [value]
         raise RuntimeError("dotnet SDK/runtime not found; install .NET 10 SDK or set SS14_DOTNET")
 
-    def _embedded_ensure_dotnet_sdk(self) -> list[str]:
-        preferred = Path(_env("SS14_DOTNET", "/opt/dotnet/dotnet") or "/opt/dotnet/dotnet")
-        try:
-            existing = self._embedded_dotnet_command()
-        except RuntimeError:
-            existing = [str(preferred)]
+    def _embedded_list_installed_sdks(self, dotnet_cmd: list[str]) -> set[str]:
         try:
             proc = subprocess.run(
-                [*existing, "--list-sdks"],
+                [*dotnet_cmd, "--list-sdks"],
                 capture_output=True,
                 text=True,
                 timeout=20,
                 check=False,
             )
-            if proc.returncode == 0 and any(line.strip().startswith("10.") for line in (proc.stdout or "").splitlines()):
-                return existing
         except Exception:
-            pass
+            return set()
+        if proc.returncode != 0:
+            return set()
+        versions: set[str] = set()
+        for raw_line in (proc.stdout or "").splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            version = line.split(" ", 1)[0].strip()
+            if version:
+                versions.add(version)
+        return versions
+
+    def _embedded_required_sdk_versions(self, source_dir: Path) -> list[str]:
+        global_json = source_dir / "global.json"
+        if not global_json.exists():
+            return []
+        try:
+            parsed = json.loads(global_json.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            return []
+        sdk = parsed.get("sdk") if isinstance(parsed, dict) else None
+        version = str((sdk or {}).get("version") or "").strip() if isinstance(sdk, dict) else ""
+        if not version:
+            return []
+        return [version]
+
+    def _embedded_sync_git_repo(self, source_dir: Path, repo_url: str, branch: str, *, recursive: bool = True) -> None:
+        source_dir.parent.mkdir(parents=True, exist_ok=True)
+        git_cmd = shutil.which("git")
+        if not git_cmd:
+            raise RuntimeError("git not found; cannot sync repository")
+        if not (source_dir / ".git").exists():
+            subprocess.run(
+                [git_cmd, "clone", "--recursive", repo_url, str(source_dir)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=600,
+                check=True,
+            )
+        subprocess.run([git_cmd, "fetch", "--all", "--prune"], cwd=source_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=300, check=True)
+        subprocess.run([git_cmd, "checkout", branch], cwd=source_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=120, check=True)
+        subprocess.run([git_cmd, "pull", "--ff-only", "origin", branch], cwd=source_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=300, check=True)
+        if recursive:
+            subprocess.run([git_cmd, "submodule", "update", "--init", "--recursive"], cwd=source_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=600, check=True)
+
+    def _embedded_ensure_dotnet_sdk(self, required_versions: list[str] | None = None) -> list[str]:
+        preferred = Path(_env("SS14_DOTNET", "/opt/dotnet/dotnet") or "/opt/dotnet/dotnet")
+        try:
+            existing = self._embedded_dotnet_command()
+        except RuntimeError:
+            existing = [str(preferred)]
+        installed = self._embedded_list_installed_sdks(existing)
+        wanted_versions: list[str] = []
+        for raw in required_versions or []:
+            version = str(raw or "").strip()
+            if version and version not in wanted_versions:
+                wanted_versions.append(version)
+        has_dotnet_10 = any(version.startswith("10.") for version in installed)
+        missing_versions = [version for version in wanted_versions if version not in installed]
+        if has_dotnet_10 and not missing_versions:
+            return existing
 
         install_script = Path("/tmp/dotnet-install.sh")
         installer_url = _env("SS14_DOTNET_INSTALL_URL", "https://dot.net/v1/dotnet-install.sh") or "https://dot.net/v1/dotnet-install.sh"
@@ -1158,41 +1214,40 @@ class AgentRuntime:
         env = os.environ.copy()
         env.setdefault("DOTNET_CLI_HOME", "/tmp")
         bash = shutil.which("bash") or "/bin/bash"
-        try:
-            subprocess.run(
-                [bash, str(install_script), "--channel", "10.0", "--install-dir", str(install_dir)],
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=1800,
-                check=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            stderr_tail = str(exc.stderr or "").strip()[-1200:]
-            raise RuntimeError(f"dotnet-install.sh failed with code {exc.returncode}: {stderr_tail or 'no stderr'}")
+        if not has_dotnet_10:
+            try:
+                subprocess.run(
+                    [bash, str(install_script), "--channel", "10.0", "--install-dir", str(install_dir)],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=1800,
+                    check=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                stderr_tail = str(exc.stderr or "").strip()[-1200:]
+                raise RuntimeError(f"dotnet-install.sh failed with code {exc.returncode}: {stderr_tail or 'no stderr'}")
+        for version in missing_versions:
+            try:
+                subprocess.run(
+                    [bash, str(install_script), "--version", version, "--install-dir", str(install_dir)],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=1800,
+                    check=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                stderr_tail = str(exc.stderr or "").strip()[-1200:]
+                raise RuntimeError(f"dotnet-install.sh failed for SDK {version} with code {exc.returncode}: {stderr_tail or 'no stderr'}")
         if not preferred.exists():
             raise RuntimeError(f"dotnet 10 installation completed but {preferred} was not found")
         return [str(preferred)]
 
     def _embedded_ensure_watchdog_source(self, source_dir: Path, repo_url: str, branch: str) -> None:
-        source_dir.parent.mkdir(parents=True, exist_ok=True)
-        git_cmd = shutil.which("git")
-        if not git_cmd:
-            raise RuntimeError("git not found; cannot bootstrap SS14.Watchdog")
-        if not (source_dir / ".git").exists():
-            subprocess.run(
-                [git_cmd, "clone", "--recursive", repo_url, str(source_dir)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=600,
-                check=True,
-            )
-        subprocess.run([git_cmd, "fetch", "--all", "--prune"], cwd=source_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=300, check=True)
-        subprocess.run([git_cmd, "checkout", branch], cwd=source_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=120, check=True)
-        subprocess.run([git_cmd, "pull", "--ff-only", "origin", branch], cwd=source_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=300, check=True)
-        subprocess.run([git_cmd, "submodule", "update", "--init", "--recursive"], cwd=source_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=600, check=True)
+        self._embedded_sync_git_repo(source_dir, repo_url, branch, recursive=True)
 
     def _embedded_install_watchdog(self, wd_root: Path) -> list[str]:
         repo_url = _env("SS14_WD_SOURCE_REPO", "https://github.com/space-wizards/SS14.Watchdog") or "https://github.com/space-wizards/SS14.Watchdog"
@@ -1578,6 +1633,14 @@ class AgentRuntime:
                 encoding="utf-8",
             )
             self._embedded_rebuild_appsettings(appsettings_base, appsettings_out, fragments_dir)
+            try:
+                source_dir = inst_dir / "source"
+                self._embedded_sync_git_repo(source_dir, repo, branch, recursive=True)
+                required_sdk_versions = self._embedded_required_sdk_versions(source_dir)
+                if required_sdk_versions:
+                    self._embedded_ensure_dotnet_sdk(required_versions=required_sdk_versions)
+            except Exception as exc:
+                logger.warning("embedded preflight for instance source %s failed: %s", slug, exc)
             self._embedded_fix_ownership(wd_root, wd_fs_user, wd_fs_group)
             self._embedded_fix_ownership(inst_dir, wd_fs_user, wd_fs_group)
             self._embedded_fix_ownership(fragments_dir, wd_fs_user, wd_fs_group, recursive=False)
@@ -1654,12 +1717,15 @@ class AgentRuntime:
                 return True, result, None
             return False, result, f"create-slug command failed with code {proc.returncode}"
 
-        if _env_bool("AGENT_EMBEDDED_CREATE_SLUG", True):
+        embedded_enabled = _env_bool("AGENT_EMBEDDED_CREATE_SLUG", True)
+        prefer_local_api = _env_bool("AGENT_PREFER_LOCAL_API", False)
+        if embedded_enabled and not prefer_local_api:
             return self._embedded_create_slug(body or {})
 
         local_api = _default_local_api_url()
         token = _local_api_token(self)
         headers = {"X-API-Token": token or "", "Content-Type": "application/json"}
+        local_api_error: str | None = None
         try:
             res = requests.post(
                 f"{local_api}/api/ss14/instances",
@@ -1668,19 +1734,32 @@ class AgentRuntime:
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
-            return (
-                False,
-                {"local_api": local_api},
-                f"local edge API is unreachable at {local_api}: {exc}",
-            )
-        ok = res.status_code < 400
-        try:
-            data: Any = res.json()
-        except Exception:
-            data = {"raw": (res.text or "")[-3000:]}
-        if ok:
-            return True, {"status_code": res.status_code, "response": data, "fallback": "create-instance"}, None
-        return False, {"status_code": res.status_code, "response": data}, "local api fallback failed"
+            local_api_error = f"local edge API is unreachable at {local_api}: {exc}"
+        else:
+            ok = res.status_code < 400
+            try:
+                data = res.json()
+            except Exception:
+                data = {"raw": (res.text or "")[-3000:]}
+            if ok:
+                return True, {"status_code": res.status_code, "response": data, "fallback": "create-instance"}, None
+            should_fallback_embedded = res.status_code >= 500 or res.status_code in {404, 405}
+            if not should_fallback_embedded or not embedded_enabled:
+                return False, {"status_code": res.status_code, "response": data}, "local api fallback failed"
+            local_api_error = f"local api fallback failed: status={res.status_code}"
+
+        if embedded_enabled:
+            ok, data, error = self._embedded_create_slug(body or {})
+            if ok:
+                if local_api_error:
+                    data = dict(data or {})
+                    data["local_api_warning"] = local_api_error
+                return ok, data, error
+            if local_api_error:
+                error = f"{error} | {local_api_error}" if error else local_api_error
+            return ok, data, error
+
+        return False, {"local_api": local_api}, local_api_error or "create-slug failed"
 
     def _require_admin_token(self, token: str | None) -> None:
         expected = self.admin_token
