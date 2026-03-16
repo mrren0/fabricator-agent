@@ -309,6 +309,7 @@ class AgentRuntime:
         self._next_config_sync_at = 0.0
         self._config_snapshot_hashes: dict[str, str] = {}
         self._load_token_file()
+        self._embedded_reconcile_watchdog_services()
 
     @staticmethod
     def supported_instruction_kinds() -> list[str]:
@@ -1325,6 +1326,113 @@ class AgentRuntime:
             ordered.append(normalized)
         return ordered
 
+    def _embedded_normalize_service_name(self, service_name: str) -> str:
+        normalized = str(service_name or "").strip()
+        if normalized and not normalized.endswith(".service"):
+            normalized = f"{normalized}.service"
+        return normalized
+
+    def _embedded_repair_watchdog_service_env(self, service_name: str) -> bool:
+        unit_name = self._embedded_normalize_service_name(service_name)
+        if not unit_name:
+            return False
+        try:
+            proc = subprocess.run(
+                [
+                    "systemctl",
+                    "show",
+                    unit_name,
+                    "--no-pager",
+                    "--property=ExecStart,Environment",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            return False
+        if proc.returncode != 0:
+            return False
+        text = (proc.stdout or "").strip()
+        if not text:
+            return False
+        exec_line = ""
+        env_line = ""
+        for line in text.splitlines():
+            if line.startswith("ExecStart="):
+                exec_line = line
+            elif line.startswith("Environment="):
+                env_line = line
+        if not exec_line:
+            return False
+        match = re.search(r"(/[^\\s\"';=]+/dotnet)\\b", exec_line)
+        if not match:
+            return False
+        dotnet_bin = match.group(1)
+        dotnet_root = str(Path(dotnet_bin).parent)
+        if dotnet_root in {"/usr/bin", "/bin"}:
+            return False
+        env_low = env_line.lower()
+        dotnet_root_low = dotnet_root.lower()
+        has_dotnet_root = f"dotnet_root={dotnet_root_low}" in env_low
+        has_dotnet_root_x64 = f"dotnet_root_x64={dotnet_root_low}" in env_low
+        has_dotnet_path = "path=" in env_low and dotnet_root_low in env_low
+        if has_dotnet_root and has_dotnet_root_x64 and has_dotnet_path:
+            return False
+        system_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        dropin_dir = Path("/etc/systemd/system") / f"{unit_name}.d"
+        dropin_path = dropin_dir / "20-dotnet-path.conf"
+        dropin_body = (
+            "[Service]\n"
+            f"Environment=DOTNET_ROOT={dotnet_root}\n"
+            f"Environment=DOTNET_ROOT_X64={dotnet_root}\n"
+            f"Environment=PATH={dotnet_root}:{system_path}\n"
+        )
+        try:
+            dropin_dir.mkdir(parents=True, exist_ok=True)
+            if dropin_path.exists():
+                existing = dropin_path.read_text(encoding="utf-8")
+                if existing == dropin_body:
+                    return False
+            dropin_path.write_text(dropin_body, encoding="utf-8")
+        except Exception:
+            return False
+        subprocess.run(["systemctl", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=20)
+        logger.info("Applied watchdog service env fix for %s", unit_name)
+        return True
+
+    def _embedded_reconcile_watchdog_services(self) -> None:
+        try:
+            if os.geteuid() != 0:
+                return
+        except Exception:
+            return
+        explicit = str(_env("SS14_WD_SYSTEMD_SERVICE", "") or "").strip()
+        patched: list[str] = []
+        for candidate in self._embedded_guess_watchdog_services(explicit):
+            try:
+                if self._embedded_repair_watchdog_service_env(candidate):
+                    normalized = self._embedded_normalize_service_name(candidate)
+                    if normalized:
+                        patched.append(normalized)
+            except Exception:
+                continue
+        for unit_name in patched:
+            try:
+                subprocess.run(
+                    ["systemctl", "restart", unit_name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+            except Exception:
+                pass
+        if patched:
+            logger.info("Reconciled watchdog systemd env for: %s", ", ".join(patched))
+
     def _embedded_find_watchdog_command(self, wd_root: Path) -> list[str]:
         candidates = [
             wd_root / "SS14.Watchdog",
@@ -1551,9 +1659,7 @@ class AgentRuntime:
         raise RuntimeError("SS14.Watchdog build succeeded but SS14.Watchdog.dll was not found")
 
     def _embedded_bootstrap_watchdog_service(self, service_name: str, wd_root: Path, user: str, group: str) -> str:
-        unit_name = str(service_name or "").strip() or "ss14-watchdog.service"
-        if not unit_name.endswith(".service"):
-            unit_name = f"{unit_name}.service"
+        unit_name = self._embedded_normalize_service_name(service_name) or "ss14-watchdog.service"
         try:
             exec_parts = self._embedded_find_watchdog_command(wd_root)
         except RuntimeError:
@@ -1584,10 +1690,12 @@ class AgentRuntime:
                     dotnet_root = str(first.parent)
         exec_start = " ".join(shlex.quote(part) for part in exec_parts)
         env_block = ""
+        system_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         if dotnet_root:
             env_block = (
                 f"Environment=DOTNET_ROOT={dotnet_root}\n"
                 f"Environment=DOTNET_ROOT_X64={dotnet_root}\n"
+                f"Environment=PATH={dotnet_root}:{system_path}\n"
             )
         env_block += (
             f"Environment=HOME={service_home}\n"
@@ -1623,7 +1731,7 @@ class AgentRuntime:
 
     def _embedded_restart_watchdog(self, service_name: str, wd_root: Path, user: str, group: str) -> str:
         errors: list[str] = []
-        explicit = str(service_name or "").strip()
+        explicit = self._embedded_normalize_service_name(service_name)
         legacy_names = {
             "SS14.Watchdog",
             "SS14.Watchdog.service",
@@ -1645,6 +1753,10 @@ class AgentRuntime:
             errors.append(f"{bootstrapped}: rc={proc.returncode} {(proc.stderr or '').strip()}")
             raise RuntimeError("watchdog restart failed; tried: " + " | ".join(errors[-4:]))
         for candidate in self._embedded_guess_watchdog_services(service_name):
+            try:
+                self._embedded_repair_watchdog_service_env(candidate)
+            except Exception:
+                pass
             proc = subprocess.run(
                 ["systemctl", "restart", candidate],
                 stdout=subprocess.DEVNULL,
