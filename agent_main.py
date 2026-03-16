@@ -1332,6 +1332,21 @@ class AgentRuntime:
             normalized = f"{normalized}.service"
         return normalized
 
+    def _embedded_expected_watchdog_description(self, unit_name: str) -> str:
+        raw = self._embedded_normalize_service_name(unit_name)
+        if raw.endswith(".service"):
+            raw = raw[:-8]
+        low = raw.lower()
+        if low.startswith("ss14.watchdog-"):
+            slug = raw[len("SS14.Watchdog-") :].strip()
+            if slug:
+                return f"SS14 Watchdog ({slug})"
+        if low.startswith("ss14-watchdog-"):
+            slug = raw[len("ss14-watchdog-") :].strip()
+            if slug:
+                return f"SS14 Watchdog ({slug})"
+        return "SS14 Watchdog"
+
     def _embedded_repair_watchdog_service_env(self, service_name: str) -> bool:
         unit_name = self._embedded_normalize_service_name(service_name)
         if not unit_name:
@@ -1343,7 +1358,7 @@ class AgentRuntime:
                     "show",
                     unit_name,
                     "--no-pager",
-                    "--property=ExecStart,Environment",
+                    "--property=ExecStart,Environment,Description,Restart,OOMPolicy",
                 ],
                 capture_output=True,
                 text=True,
@@ -1359,47 +1374,108 @@ class AgentRuntime:
             return False
         exec_line = ""
         env_line = ""
+        description_line = ""
+        restart_line = ""
+        oom_policy_line = ""
         for line in text.splitlines():
             if line.startswith("ExecStart="):
                 exec_line = line
             elif line.startswith("Environment="):
                 env_line = line
+            elif line.startswith("Description="):
+                description_line = line
+            elif line.startswith("Restart="):
+                restart_line = line
+            elif line.startswith("OOMPolicy="):
+                oom_policy_line = line
         if not exec_line:
             return False
         match = re.search(r"(/[^\\s\"';=]+/dotnet)\\b", exec_line)
-        if not match:
+        needs_reload = False
+        patched_sections: list[str] = []
+        if match:
+            dotnet_bin = match.group(1)
+            dotnet_root = str(Path(dotnet_bin).parent)
+            if dotnet_root not in {"/usr/bin", "/bin"}:
+                env_low = env_line.lower()
+                dotnet_root_low = dotnet_root.lower()
+                has_dotnet_root = f"dotnet_root={dotnet_root_low}" in env_low
+                has_dotnet_root_x64 = f"dotnet_root_x64={dotnet_root_low}" in env_low
+                has_dotnet_path = "path=" in env_low and dotnet_root_low in env_low
+                if not (has_dotnet_root and has_dotnet_root_x64 and has_dotnet_path):
+                    system_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                    dropin_dir = Path("/etc/systemd/system") / f"{unit_name}.d"
+                    dropin_path = dropin_dir / "20-dotnet-path.conf"
+                    dropin_body = (
+                        "[Service]\n"
+                        f"Environment=DOTNET_ROOT={dotnet_root}\n"
+                        f"Environment=DOTNET_ROOT_X64={dotnet_root}\n"
+                        f"Environment=PATH={dotnet_root}:{system_path}\n"
+                    )
+                    try:
+                        dropin_dir.mkdir(parents=True, exist_ok=True)
+                        existing = dropin_path.read_text(encoding="utf-8") if dropin_path.exists() else ""
+                        if existing != dropin_body:
+                            dropin_path.write_text(dropin_body, encoding="utf-8")
+                            needs_reload = True
+                            patched_sections.append("env")
+                    except Exception:
+                        return False
+
+        restart_policy = (_env("SS14_WD_RESTART_POLICY", "always") or "always").strip()
+        if not restart_policy:
+            restart_policy = "always"
+        restart_sec = (_env("SS14_WD_RESTART_SEC", "5") or "5").strip()
+        if not restart_sec:
+            restart_sec = "5"
+        oom_policy = (_env("SS14_WD_OOM_POLICY", "continue") or "continue").strip().lower()
+        if oom_policy not in {"continue", "stop", "kill"}:
+            oom_policy = "continue"
+        current_restart = (restart_line.removeprefix("Restart=").strip().lower() if restart_line else "")
+        current_oom_policy = (oom_policy_line.removeprefix("OOMPolicy=").strip().lower() if oom_policy_line else "")
+        if current_restart != restart_policy.lower() or current_oom_policy != oom_policy:
+            dropin_dir = Path("/etc/systemd/system") / f"{unit_name}.d"
+            dropin_path = dropin_dir / "30-watchdog-policy.conf"
+            dropin_body = (
+                "[Service]\n"
+                f"Restart={restart_policy}\n"
+                f"RestartSec={restart_sec}\n"
+                f"OOMPolicy={oom_policy}\n"
+            )
+            try:
+                dropin_dir.mkdir(parents=True, exist_ok=True)
+                existing = dropin_path.read_text(encoding="utf-8") if dropin_path.exists() else ""
+                if existing != dropin_body:
+                    dropin_path.write_text(dropin_body, encoding="utf-8")
+                    needs_reload = True
+                    patched_sections.append("policy")
+            except Exception:
+                return False
+
+        expected_description = self._embedded_expected_watchdog_description(unit_name)
+        current_description = description_line.removeprefix("Description=").strip() if description_line else ""
+        if expected_description and current_description != expected_description:
+            dropin_dir = Path("/etc/systemd/system") / f"{unit_name}.d"
+            dropin_path = dropin_dir / "40-watchdog-description.conf"
+            dropin_body = (
+                "[Unit]\n"
+                f"Description={expected_description}\n"
+            )
+            try:
+                dropin_dir.mkdir(parents=True, exist_ok=True)
+                existing = dropin_path.read_text(encoding="utf-8") if dropin_path.exists() else ""
+                if existing != dropin_body:
+                    dropin_path.write_text(dropin_body, encoding="utf-8")
+                    needs_reload = True
+                    patched_sections.append("description")
+            except Exception:
+                return False
+
+        if not needs_reload:
             return False
-        dotnet_bin = match.group(1)
-        dotnet_root = str(Path(dotnet_bin).parent)
-        if dotnet_root in {"/usr/bin", "/bin"}:
-            return False
-        env_low = env_line.lower()
-        dotnet_root_low = dotnet_root.lower()
-        has_dotnet_root = f"dotnet_root={dotnet_root_low}" in env_low
-        has_dotnet_root_x64 = f"dotnet_root_x64={dotnet_root_low}" in env_low
-        has_dotnet_path = "path=" in env_low and dotnet_root_low in env_low
-        if has_dotnet_root and has_dotnet_root_x64 and has_dotnet_path:
-            return False
-        system_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        dropin_dir = Path("/etc/systemd/system") / f"{unit_name}.d"
-        dropin_path = dropin_dir / "20-dotnet-path.conf"
-        dropin_body = (
-            "[Service]\n"
-            f"Environment=DOTNET_ROOT={dotnet_root}\n"
-            f"Environment=DOTNET_ROOT_X64={dotnet_root}\n"
-            f"Environment=PATH={dotnet_root}:{system_path}\n"
-        )
-        try:
-            dropin_dir.mkdir(parents=True, exist_ok=True)
-            if dropin_path.exists():
-                existing = dropin_path.read_text(encoding="utf-8")
-                if existing == dropin_body:
-                    return False
-            dropin_path.write_text(dropin_body, encoding="utf-8")
-        except Exception:
-            return False
+
         subprocess.run(["systemctl", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=20)
-        logger.info("Applied watchdog service env fix for %s", unit_name)
+        logger.info("Applied watchdog service fix for %s (%s)", unit_name, ", ".join(patched_sections) or "none")
         return True
 
     def _embedded_reconcile_watchdog_services(self) -> None:
@@ -1707,6 +1783,15 @@ class AgentRuntime:
             "Environment=DOTNET_CLI_TELEMETRY_OPTOUT=1\n"
             "Environment=DOTNET_NOLOGO=1\n"
         )
+        restart_policy = (_env("SS14_WD_RESTART_POLICY", "always") or "always").strip()
+        if not restart_policy:
+            restart_policy = "always"
+        restart_sec = (_env("SS14_WD_RESTART_SEC", "5") or "5").strip()
+        if not restart_sec:
+            restart_sec = "5"
+        oom_policy = (_env("SS14_WD_OOM_POLICY", "continue") or "continue").strip().lower()
+        if oom_policy not in {"continue", "stop", "kill"}:
+            oom_policy = "continue"
         unit_path = Path("/etc/systemd/system") / unit_name
         unit_body = (
             "[Unit]\n"
@@ -1719,8 +1804,9 @@ class AgentRuntime:
             f"ExecStart={exec_start}\n"
             f"User={user}\n"
             f"Group={group}\n"
-            "Restart=always\n"
-            "RestartSec=5\n\n"
+            f"Restart={restart_policy}\n"
+            f"RestartSec={restart_sec}\n"
+            f"OOMPolicy={oom_policy}\n\n"
             "[Install]\n"
             "WantedBy=multi-user.target\n"
         )
@@ -2231,6 +2317,11 @@ class AgentRuntime:
             except Exception:
                 data = {"raw": (res.text or "")[-3000:]}
             if ok:
+                if kind == "update-instance":
+                    try:
+                        self._embedded_reconcile_watchdog_services()
+                    except Exception:
+                        logger.exception("watchdog service reconcile after update-instance failed")
                 return True, {"status_code": res.status_code, "response": data}, None
             return False, {"status_code": res.status_code, "response": data}, "local api call failed"
         return False, {}, f"unsupported instruction kind: {kind}"
