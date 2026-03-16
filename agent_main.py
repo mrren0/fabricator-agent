@@ -196,17 +196,7 @@ except Exception:
 
 
 def _default_self_update_command() -> str:
-    return (
-        "if [ -d /root/fabricator-agent/.git ]; then "
-        "cd /root/fabricator-agent && git fetch --all --prune && git checkout main && "
-        "git pull --ff-only origin main && bash scripts/remote_deploy.sh /root/fabricator-agent; "
-        "elif [ -d /opt/fabricator-agent-src/.git ]; then "
-        "cd /opt/fabricator-agent-src && git fetch --all --prune && git checkout main && "
-        "git pull --ff-only origin main && bash scripts/remote_deploy.sh /opt/fabricator-agent-src; "
-        "else "
-        "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade fabricator-agent; "
-        "fi"
-    )
+    return "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade fabricator-agent"
 
 
 def _detached_popen(cmd: str, *, env: dict[str, str]) -> subprocess.Popen[str]:

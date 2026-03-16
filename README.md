@@ -2,41 +2,36 @@
 
 Minimal remote agent used by Fabricator core.
 
-## Complete Install (Ubuntu)
+## Install (Ubuntu)
 
 ```bash
-# 1) Fetch repository
 sudo apt update
 sudo apt install -y git build-essential debhelper dh-python python3 python3-venv
-cd /root
-if [ ! -d fabricator-agent/.git ]; then
-  git clone https://github.com/ren0san/fabricator-agent.git
+cd ~
+if [ ! -d ~/fabricator-agent/.git ]; then
+  git clone https://github.com/ren0san/fabricator-agent.git ~/fabricator-agent
 fi
-cd fabricator-agent
-
-# 2) Build, install/reinstall, restart service
-sudo bash scripts/remote_deploy.sh /root/fabricator-agent
-
-# 3) Verify
+cd ~/fabricator-agent
+dpkg-buildpackage -us -uc -b
+sudo apt-get install -y --reinstall ../fabricator-agent_*_all.deb
+sudo systemctl daemon-reload
+sudo systemctl enable --now fabricator-agent.service
+sudo systemctl restart fabricator-agent.service
 systemctl status fabricator-agent --no-pager || true
 curl -sS http://127.0.0.1:8010/health
 curl -sS http://127.0.0.1:8010/status
 ```
 
-## Complete Update (Ubuntu)
+## Update (Ubuntu)
 
 ```bash
-# Option A (recommended): trigger instruction from Fabricator core
-# kind = self-update-agent
-
-# Option B: update manually from GitHub
 sudo apt update
 sudo apt install -y git
-cd /root
-if [ ! -d /root/fabricator-agent/.git ]; then
-  git clone https://github.com/ren0san/fabricator-agent.git /root/fabricator-agent
+cd ~
+if [ ! -d ~/fabricator-agent/.git ]; then
+  git clone https://github.com/ren0san/fabricator-agent.git ~/fabricator-agent
 fi
-cd /root/fabricator-agent
+cd ~/fabricator-agent
 git remote set-url origin https://github.com/ren0san/fabricator-agent.git
 git remote -v
 git fetch --all --prune
@@ -45,8 +40,11 @@ git reset --hard origin/main
 git log -1 --oneline
 grep -n "FABRICATOR_AGENT_SOURCE_REPO" agent_main.py
 grep -n "last_instruction_id" agent_main.py
-sudo bash scripts/remote_deploy.sh /root/fabricator-agent
-sudo systemctl restart fabricator-agent
+dpkg-buildpackage -us -uc -b
+sudo apt-get install -y --reinstall ../fabricator-agent_*_all.deb
+sudo systemctl daemon-reload
+sudo systemctl enable --now fabricator-agent.service
+sudo systemctl restart fabricator-agent.service
 sleep 5
 systemctl status fabricator-agent --no-pager || true
 curl -sS http://127.0.0.1:8010/status | jq
