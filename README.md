@@ -85,6 +85,7 @@ sudo tee /etc/default/fabricator-agent >/dev/null <<'EOF'
 AGENT_BACKEND_URL=https://api.thun-der.ru
 AGENT_HTTP_PORT=8010
 AGENT_INSTRUCTION_WAIT_SECONDS=25
+AGENT_INSTRUCTION_LIMIT=1
 AGENT_HEARTBEAT_SECONDS=30
 AGENT_CONFIG_SYNC_SECONDS=30
 AGENT_LOG_LEVEL=INFO
@@ -113,6 +114,7 @@ Remote-only default behavior:
 - self-update command is rejected if it tries to restart any systemd unit other than `fabricator-agent(.service)`
 - the core control plane talks to the agent via outbound long-poll + ack; no public inbound agent port is required
 - `AGENT_INSTRUCTION_WAIT_SECONDS` controls long-poll hold time on master instruction queue
+- `AGENT_INSTRUCTION_LIMIT` controls how many instructions are leased per pull (`1` by default to avoid long pre-leased tails)
 - `AGENT_HEARTBEAT_SECONDS` controls how often the agent sends heartbeat while pull runs continuously
 - `AGENT_CONFIG_SYNC_SECONDS` controls how often the agent scans and uploads changed remote `config.toml` snapshots to the master cache
 - local edge token fallback order:

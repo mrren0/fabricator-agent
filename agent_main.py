@@ -337,6 +337,7 @@ class AgentRuntime:
         self.poll_seconds = int(_env("AGENT_POLL_SECONDS", "10") or "10")
         self.timeout = int(_env("AGENT_HTTP_TIMEOUT_SECONDS", "10") or "10")
         self.instruction_wait_seconds = max(0, int(_env("AGENT_INSTRUCTION_WAIT_SECONDS", "25") or "25"))
+        self.instruction_limit = max(1, min(25, int(_env("AGENT_INSTRUCTION_LIMIT", "1") or "1")))
         self.heartbeat_seconds = max(5, int(_env("AGENT_HEARTBEAT_SECONDS", "30") or "30"))
         self.config_sync_seconds = max(
             5,
@@ -368,6 +369,7 @@ class AgentRuntime:
             "last_instruction_error": None,
             "last_instruction_result": None,
             "last_pull_next_poll_seconds": None,
+            "instruction_limit": self.instruction_limit,
             "config_sha256": None,
             "last_config_snapshot_sync_at": None,
             "last_config_snapshot_count": 0,
@@ -695,7 +697,7 @@ class AgentRuntime:
         if self.agent_token:
             res = requests.get(
                 f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions",
-                params={"limit": 25, "wait_seconds": wait_seconds},
+                params={"limit": int(self.instruction_limit), "wait_seconds": wait_seconds},
                 headers=self._runtime_headers(),
                 timeout=request_timeout,
             )
@@ -717,7 +719,7 @@ class AgentRuntime:
 
         res = requests.get(
             f"{self.backend_url}/api/agent/instructions/{self.agent_id}",
-            params={"limit": 25, "wait_seconds": wait_seconds},
+            params={"limit": int(self.instruction_limit), "wait_seconds": wait_seconds},
             headers=self._headers(),
             timeout=request_timeout,
         )
