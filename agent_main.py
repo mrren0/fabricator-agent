@@ -52,6 +52,21 @@ logger = logging.getLogger("fabricator-agent")
 DEFAULT_LOCAL_EDGE_URL = "http://127.0.0.1:8000"
 
 
+def _configure_agent_logger() -> None:
+    level_raw = (_env("AGENT_LOG_LEVEL", "INFO") or "INFO").strip().upper()
+    level = getattr(logging, level_raw, logging.INFO)
+    logger.setLevel(level)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        logger.addHandler(handler)
+    logger.propagate = False
+
+
+_configure_agent_logger()
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = _env(name)
     if raw is None:
@@ -70,6 +85,17 @@ def _local_api_token(runtime: "AgentRuntime") -> str:
         or runtime.api_token
         or ""
     )
+
+
+def _log_tail(value: Any, *, limit: int = 700) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=True, sort_keys=True)
+    except Exception:
+        text = str(value)
+    text = str(text).replace("\n", "\\n").replace("\r", "\\r")
+    if len(text) > limit:
+        return text[:limit] + "...(truncated)"
+    return text
 
 
 def _normalize_host(raw: str | None) -> str:
@@ -276,6 +302,7 @@ class AgentRuntime:
         self.diagnostic_timeout = int(_env("AGENT_DIAG_TIMEOUT_SECONDS", "45") or "45")
         self.output_tail_chars = int(_env("AGENT_OUTPUT_TAIL_CHARS", "4000") or "4000")
         self.fabricator_service_name = _env("AGENT_FABRICATOR_SERVICE", "ss14-provisioner") or "ss14-provisioner"
+        self.local_api_url = _default_local_api_url()
         self._legacy_auth_disabled = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -310,6 +337,28 @@ class AgentRuntime:
         self._config_snapshot_hashes: dict[str, str] = {}
         self._load_token_file()
         self._embedded_reconcile_watchdog_services()
+        logger.info(
+            "Agent runtime initialized agent_id=%s backend_url=%s local_api_url=%s poll=%ss wait=%ss heartbeat=%ss",
+            self.agent_id,
+            self.backend_url,
+            self.local_api_url,
+            self.poll_seconds,
+            self.instruction_wait_seconds,
+            self.heartbeat_seconds,
+        )
+        local_host = _normalize_host(self.local_api_url)
+        backend_host = _normalize_host(self.backend_url)
+        if (
+            local_host
+            and backend_host
+            and local_host == backend_host
+            and local_host not in {"127.0.0.1", "localhost", "::1"}
+        ):
+            logger.warning(
+                "AGENT_LOCAL_API_URL points to the same host as AGENT_BACKEND_URL (%s). "
+                "This can cause remote instruction loops.",
+                local_host,
+            )
 
     @staticmethod
     def supported_instruction_kinds() -> list[str]:
@@ -2284,7 +2333,7 @@ class AgentRuntime:
             "update-instance",
             "repair-instance",
         }:
-            local_api = _default_local_api_url()
+            local_api = self.local_api_url or _default_local_api_url()
             token = _local_api_token(self)
             endpoints = {
                 "create-instance": ("POST", "/api/ss14/instances"),
@@ -2306,9 +2355,27 @@ class AgentRuntime:
                 reason = str(payload.get("reason") or "").strip()
                 if reason:
                     headers["X-Reason"] = reason
+            instruction_id = str(item.get("id") or "").strip() or "-"
+            slug = str(payload.get("slug") or "").strip() or "-"
+            logger.info(
+                "Executing instruction id=%s kind=%s slug=%s via %s %s",
+                instruction_id,
+                kind,
+                slug,
+                method,
+                url,
+            )
             try:
                 res = requests.request(method, url, **kwargs)
             except requests.RequestException as exc:
+                logger.error(
+                    "Instruction id=%s kind=%s slug=%s request failed url=%s error=%s",
+                    instruction_id,
+                    kind,
+                    slug,
+                    url,
+                    exc,
+                )
                 return False, {"local_api": local_api}, f"local edge API is unreachable at {local_api}: {exc}"
             ok = res.status_code < 400
             data: Any
@@ -2316,6 +2383,36 @@ class AgentRuntime:
                 data = res.json()
             except Exception:
                 data = {"raw": (res.text or "")[-3000:]}
+            logger.info(
+                "Instruction id=%s kind=%s slug=%s local API response status=%s body=%s",
+                instruction_id,
+                kind,
+                slug,
+                res.status_code,
+                _log_tail(data),
+            )
+            if (
+                ok
+                and isinstance(data, dict)
+                and bool(data.get("remote_managed"))
+                and isinstance(data.get("instruction"), dict)
+            ):
+                msg = (
+                    "local API returned remote-dispatch payload instead of local execution; "
+                    "check AGENT_LOCAL_API_URL (expected local edge API)"
+                )
+                logger.error(
+                    "Instruction id=%s kind=%s slug=%s rejected as non-local result: %s",
+                    instruction_id,
+                    kind,
+                    slug,
+                    _log_tail(data),
+                )
+                return (
+                    False,
+                    {"status_code": res.status_code, "response": data, "local_api": local_api, "url": url},
+                    msg,
+                )
             if ok:
                 if kind == "update-instance":
                     try:
@@ -2323,6 +2420,14 @@ class AgentRuntime:
                     except Exception:
                         logger.exception("watchdog service reconcile after update-instance failed")
                 return True, {"status_code": res.status_code, "response": data}, None
+            logger.warning(
+                "Instruction id=%s kind=%s slug=%s local API failed status=%s body=%s",
+                instruction_id,
+                kind,
+                slug,
+                res.status_code,
+                _log_tail(data),
+            )
             return False, {"status_code": res.status_code, "response": data}, "local api call failed"
         return False, {}, f"unsupported instruction kind: {kind}"
 
@@ -2360,6 +2465,12 @@ class AgentRuntime:
                 for item in items:
                     instruction_id = str(item.get("id") or "")
                     instruction_kind = str(item.get("kind") or "").strip().lower() or None
+                    logger.info(
+                        "Instruction received id=%s kind=%s payload=%s",
+                        instruction_id or "-",
+                        instruction_kind or "-",
+                        _log_tail((item or {}).get("payload") or {}),
+                    )
                     self.status["last_instruction_id"] = instruction_id or None
                     self.status["last_instruction_kind"] = instruction_kind
                     self.status["last_instruction_at"] = time.time()
@@ -2411,12 +2522,33 @@ class AgentRuntime:
                     self.status["last_instruction_ok"] = bool(ok)
                     self.status["last_instruction_error"] = error
                     self.status["last_instruction_result"] = result or {}
+                    logger.info(
+                        "Instruction finished id=%s kind=%s ok=%s error=%s result=%s",
+                        instruction_id or "-",
+                        instruction_kind or "-",
+                        bool(ok),
+                        str(error or "") or "-",
+                        _log_tail(result or {}),
+                    )
                     if error:
                         cycle_error = error
                     if ok and instruction_kind in {"create-slug", "create-instance"}:
                         self._next_config_sync_at = 0.0
                     if instruction_id:
-                        self._ack(instruction_id, ok=ok, result=result, error=error)
+                        try:
+                            self._ack(instruction_id, ok=ok, result=result, error=error)
+                            logger.info(
+                                "Instruction ack sent id=%s kind=%s ok=%s",
+                                instruction_id,
+                                instruction_kind or "-",
+                                bool(ok),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Instruction ack failed id=%s kind=%s",
+                                instruction_id,
+                                instruction_kind or "-",
+                            )
                 self.status["last_error"] = cycle_error
             except Exception as exc:
                 if isinstance(exc, HTTPError) and getattr(exc, "response", None) is not None:
