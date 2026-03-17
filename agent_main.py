@@ -226,7 +226,9 @@ def _default_self_update_command() -> str:
 
 
 def _self_update_service_name() -> str:
-    return (_env("AGENT_SELF_UPDATE_SERVICE", "fabricator-agent") or "fabricator-agent").strip() or "fabricator-agent"
+    # Safety: self-update must only restart the local fabricator-agent service.
+    # Never restart game/watchdog services from this flow.
+    return "fabricator-agent"
 
 
 def _finalize_self_update_command(cmd: str, *, restart_enabled: bool) -> str:
