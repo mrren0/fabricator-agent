@@ -117,6 +117,7 @@ Remote-only default behavior:
 - `AGENT_INSTRUCTION_LIMIT` controls how many instructions are leased per pull (`1` by default to avoid long pre-leased tails)
 - `AGENT_HEARTBEAT_SECONDS` controls how often the agent sends heartbeat while pull runs continuously
 - `AGENT_CONFIG_SYNC_SECONDS` controls how often the agent scans and uploads changed remote `config.toml` snapshots to the master cache
+- watchdog systemd defaults now include `RestartPreventExitStatus=SIGKILL` to avoid automatic watchdog restart loops after OOM kill
 - local edge token fallback order:
   - `AGENT_LOCAL_API_TOKEN`
   - `SS14_EDGE_API_TOKEN`

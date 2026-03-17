@@ -98,6 +98,26 @@ def _log_tail(value: Any, *, limit: int = 700) -> str:
     return text
 
 
+def _watchdog_restart_policy() -> str:
+    policy = (_env("SS14_WD_RESTART_POLICY", "always") or "always").strip()
+    return policy or "always"
+
+
+def _watchdog_restart_sec() -> str:
+    sec = (_env("SS14_WD_RESTART_SEC", "5") or "5").strip()
+    return sec or "5"
+
+
+def _watchdog_restart_prevent_exit_status() -> str:
+    value = (_env("SS14_WD_RESTART_PREVENT_EXIT_STATUS", "SIGKILL") or "SIGKILL").strip()
+    return value or "SIGKILL"
+
+
+def _watchdog_oom_policy() -> str:
+    policy = (_env("SS14_WD_OOM_POLICY", "continue") or "continue").strip().lower()
+    return policy if policy in {"continue", "stop", "kill"} else "continue"
+
+
 def _normalize_host(raw: str | None) -> str:
     s = str(raw or "").strip()
     if not s:
@@ -1467,7 +1487,7 @@ class AgentRuntime:
                     "show",
                     unit_name,
                     "--no-pager",
-                    "--property=ExecStart,Environment,Description,Restart,OOMPolicy",
+                    "--property=ExecStart,Environment,Description,Restart,RestartSec,RestartPreventExitStatus,OOMPolicy",
                 ],
                 capture_output=True,
                 text=True,
@@ -1485,6 +1505,8 @@ class AgentRuntime:
         env_line = ""
         description_line = ""
         restart_line = ""
+        restart_sec_line = ""
+        restart_prevent_line = ""
         oom_policy_line = ""
         for line in text.splitlines():
             if line.startswith("ExecStart="):
@@ -1495,6 +1517,10 @@ class AgentRuntime:
                 description_line = line
             elif line.startswith("Restart="):
                 restart_line = line
+            elif line.startswith("RestartSec="):
+                restart_sec_line = line
+            elif line.startswith("RestartPreventExitStatus="):
+                restart_prevent_line = line
             elif line.startswith("OOMPolicy="):
                 oom_policy_line = line
         if not exec_line:
@@ -1531,24 +1557,31 @@ class AgentRuntime:
                     except Exception:
                         return False
 
-        restart_policy = (_env("SS14_WD_RESTART_POLICY", "always") or "always").strip()
-        if not restart_policy:
-            restart_policy = "always"
-        restart_sec = (_env("SS14_WD_RESTART_SEC", "5") or "5").strip()
-        if not restart_sec:
-            restart_sec = "5"
-        oom_policy = (_env("SS14_WD_OOM_POLICY", "continue") or "continue").strip().lower()
-        if oom_policy not in {"continue", "stop", "kill"}:
-            oom_policy = "continue"
+        restart_policy = _watchdog_restart_policy()
+        restart_sec = _watchdog_restart_sec()
+        restart_prevent_exit_status = _watchdog_restart_prevent_exit_status()
+        oom_policy = _watchdog_oom_policy()
         current_restart = (restart_line.removeprefix("Restart=").strip().lower() if restart_line else "")
+        current_restart_sec = (restart_sec_line.removeprefix("RestartSec=").strip() if restart_sec_line else "")
+        current_restart_prevent = (
+            restart_prevent_line.removeprefix("RestartPreventExitStatus=").strip().upper()
+            if restart_prevent_line
+            else ""
+        )
         current_oom_policy = (oom_policy_line.removeprefix("OOMPolicy=").strip().lower() if oom_policy_line else "")
-        if current_restart != restart_policy.lower() or current_oom_policy != oom_policy:
+        if (
+            current_restart != restart_policy.lower()
+            or current_restart_sec != restart_sec
+            or current_restart_prevent != restart_prevent_exit_status.upper()
+            or current_oom_policy != oom_policy
+        ):
             dropin_dir = Path("/etc/systemd/system") / f"{unit_name}.d"
             dropin_path = dropin_dir / "30-watchdog-policy.conf"
             dropin_body = (
                 "[Service]\n"
                 f"Restart={restart_policy}\n"
                 f"RestartSec={restart_sec}\n"
+                f"RestartPreventExitStatus={restart_prevent_exit_status}\n"
                 f"OOMPolicy={oom_policy}\n"
             )
             try:
@@ -1892,15 +1925,10 @@ class AgentRuntime:
             "Environment=DOTNET_CLI_TELEMETRY_OPTOUT=1\n"
             "Environment=DOTNET_NOLOGO=1\n"
         )
-        restart_policy = (_env("SS14_WD_RESTART_POLICY", "always") or "always").strip()
-        if not restart_policy:
-            restart_policy = "always"
-        restart_sec = (_env("SS14_WD_RESTART_SEC", "5") or "5").strip()
-        if not restart_sec:
-            restart_sec = "5"
-        oom_policy = (_env("SS14_WD_OOM_POLICY", "continue") or "continue").strip().lower()
-        if oom_policy not in {"continue", "stop", "kill"}:
-            oom_policy = "continue"
+        restart_policy = _watchdog_restart_policy()
+        restart_sec = _watchdog_restart_sec()
+        restart_prevent_exit_status = _watchdog_restart_prevent_exit_status()
+        oom_policy = _watchdog_oom_policy()
         unit_path = Path("/etc/systemd/system") / unit_name
         unit_body = (
             "[Unit]\n"
@@ -1915,6 +1943,7 @@ class AgentRuntime:
             f"Group={group}\n"
             f"Restart={restart_policy}\n"
             f"RestartSec={restart_sec}\n"
+            f"RestartPreventExitStatus={restart_prevent_exit_status}\n"
             f"OOMPolicy={oom_policy}\n\n"
             "[Install]\n"
             "WantedBy=multi-user.target\n"
