@@ -225,6 +225,22 @@ def _default_self_update_command() -> str:
     return "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade fabricator-agent"
 
 
+def _self_update_service_name() -> str:
+    return (_env("AGENT_SELF_UPDATE_SERVICE", "fabricator-agent") or "fabricator-agent").strip() or "fabricator-agent"
+
+
+def _finalize_self_update_command(cmd: str, *, restart_enabled: bool) -> str:
+    base = str(cmd or "").strip()
+    if not base:
+        return ""
+    if not restart_enabled:
+        return base
+    if re.search(r"\bsystemctl\s+(?:--no-block\s+)?(?:restart|try-restart)\b", base):
+        return base
+    service = shlex.quote(_self_update_service_name())
+    return f"{base} && systemctl restart {service}"
+
+
 def _detached_popen(cmd: str, *, env: dict[str, str]) -> subprocess.Popen[str]:
     return subprocess.Popen(
         ["/bin/sh", "-lc", cmd],
@@ -878,19 +894,22 @@ class AgentRuntime:
 
     def _run_self_update(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
         payload_command = str(payload.get("command") or "").strip()
-        cmd = payload_command or (
+        base_cmd = payload_command or (
             _env(
                 "AGENT_SELF_UPDATE_COMMAND",
                 _default_self_update_command(),
             )
             or ""
         ).strip()
-        if not cmd:
+        if not base_cmd:
             return False, {}, "AGENT_SELF_UPDATE_COMMAND is empty"
         if "restart" in payload:
             restart_enabled = bool(payload.get("restart"))
         else:
             restart_enabled = _env_bool("AGENT_SELF_UPDATE_RESTART", True)
+        cmd = _finalize_self_update_command(base_cmd, restart_enabled=restart_enabled)
+        if not cmd:
+            return False, {}, "self-update command is empty after normalization"
         env = os.environ.copy()
         env["FABRICATOR_AGENT_ID"] = self.agent_id
         env["FABRICATOR_AGENT_BACKEND_URL"] = self.backend_url
@@ -917,7 +936,9 @@ class AgentRuntime:
                     "mode": "detached",
                     "pid": int(proc.pid),
                     "command": cmd,
+                    "base_command": base_cmd,
                     "restart": True,
+                    "restart_service": _self_update_service_name(),
                     "source_repo": env["FABRICATOR_AGENT_SOURCE_REPO"] or None,
                     "source_branch": env["FABRICATOR_AGENT_SOURCE_BRANCH"] or None,
                     "target_version": env["FABRICATOR_AGENT_TARGET_VERSION"] or None,
@@ -942,6 +963,7 @@ class AgentRuntime:
                 {
                     "mode": "inline",
                     "command": cmd,
+                    "base_command": base_cmd,
                     "returncode": proc.returncode,
                     "source_repo": env["FABRICATOR_AGENT_SOURCE_REPO"] or None,
                     "source_branch": env["FABRICATOR_AGENT_SOURCE_BRANCH"] or None,
@@ -958,6 +980,7 @@ class AgentRuntime:
             {
                 "mode": "inline",
                 "command": cmd,
+                "base_command": base_cmd,
                 "returncode": 0,
                 "source_repo": env["FABRICATOR_AGENT_SOURCE_REPO"] or None,
                 "source_branch": env["FABRICATOR_AGENT_SOURCE_BRANCH"] or None,

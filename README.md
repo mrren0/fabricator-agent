@@ -91,6 +91,7 @@ AGENT_LOG_LEVEL=INFO
 AGENT_LOCAL_API_URL=
 AGENT_TEST_MODE=0
 AGENT_PUBLIC_IP=
+AGENT_SELF_UPDATE_SERVICE=fabricator-agent
 
 # Optional secure auto-bind flow
 AGENT_BOOTSTRAP_TOKEN=
@@ -109,6 +110,7 @@ Remote-only default behavior:
 - if `AGENT_LOCAL_API_URL` is empty, the agent tries `http://127.0.0.1:8000`
 - `AGENT_LOG_LEVEL` controls instruction execution logs in `journalctl -u fabricator-agent` (`INFO` by default)
 - if `AGENT_LOCAL_API_URL` points to control-plane instead of local edge API, restart/update/stop instructions are rejected with explicit log error to prevent false `ok` acks
+- `AGENT_SELF_UPDATE_SERVICE` controls which systemd unit is restarted after self-update command (default: `fabricator-agent`)
 - the core control plane talks to the agent via outbound long-poll + ack; no public inbound agent port is required
 - `AGENT_INSTRUCTION_WAIT_SECONDS` controls long-poll hold time on master instruction queue
 - `AGENT_HEARTBEAT_SECONDS` controls how often the agent sends heartbeat while pull runs continuously
