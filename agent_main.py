@@ -231,13 +231,43 @@ def _self_update_service_name() -> str:
     return "fabricator-agent"
 
 
+_ALLOWED_SELF_UPDATE_RESTART_UNITS = {"fabricator-agent", "fabricator-agent.service"}
+_SELF_UPDATE_RESTART_PATTERN = re.compile(
+    r"\bsystemctl\s+(?:--no-block\s+)?(?:restart|try-restart)\s+([^\n;&|]+)",
+    re.IGNORECASE,
+)
+
+
+def _unsafe_self_update_restart_units(command: str) -> list[str]:
+    unsafe: list[str] = []
+    for match in _SELF_UPDATE_RESTART_PATTERN.finditer(str(command or "")):
+        raw_units = str(match.group(1) or "").strip()
+        if not raw_units:
+            unsafe.append("<empty>")
+            continue
+        try:
+            units = shlex.split(raw_units)
+        except Exception:
+            unsafe.append(raw_units)
+            continue
+        for unit in units:
+            normalized = str(unit or "").strip().strip("'\"")
+            if normalized and normalized not in _ALLOWED_SELF_UPDATE_RESTART_UNITS:
+                unsafe.append(normalized)
+    return unsafe
+
+
 def _finalize_self_update_command(cmd: str, *, restart_enabled: bool) -> str:
     base = str(cmd or "").strip()
     if not base:
         return ""
+    unsafe_units = _unsafe_self_update_restart_units(base)
+    if unsafe_units:
+        units = ", ".join(sorted(set(unsafe_units)))
+        raise ValueError(f"self-update command contains unsafe restart target(s): {units}")
     if not restart_enabled:
         return base
-    if re.search(r"\bsystemctl\s+(?:--no-block\s+)?(?:restart|try-restart)\b", base):
+    if _SELF_UPDATE_RESTART_PATTERN.search(base):
         return base
     service = shlex.quote(_self_update_service_name())
     return f"{base} && systemctl restart {service}"
@@ -909,7 +939,10 @@ class AgentRuntime:
             restart_enabled = bool(payload.get("restart"))
         else:
             restart_enabled = _env_bool("AGENT_SELF_UPDATE_RESTART", True)
-        cmd = _finalize_self_update_command(base_cmd, restart_enabled=restart_enabled)
+        try:
+            cmd = _finalize_self_update_command(base_cmd, restart_enabled=restart_enabled)
+        except ValueError as exc:
+            return False, {"base_command": base_cmd}, str(exc)
         if not cmd:
             return False, {}, "self-update command is empty after normalization"
         env = os.environ.copy()

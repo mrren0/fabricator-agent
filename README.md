@@ -110,6 +110,7 @@ Remote-only default behavior:
 - `AGENT_LOG_LEVEL` controls instruction execution logs in `journalctl -u fabricator-agent` (`INFO` by default)
 - if `AGENT_LOCAL_API_URL` points to control-plane instead of local edge API, restart/update/stop instructions are rejected with explicit log error to prevent false `ok` acks
 - self-update always restarts only `fabricator-agent` service
+- self-update command is rejected if it tries to restart any systemd unit other than `fabricator-agent(.service)`
 - the core control plane talks to the agent via outbound long-poll + ack; no public inbound agent port is required
 - `AGENT_INSTRUCTION_WAIT_SECONDS` controls long-poll hold time on master instruction queue
 - `AGENT_HEARTBEAT_SECONDS` controls how often the agent sends heartbeat while pull runs continuously
