@@ -651,6 +651,12 @@ class AgentRuntime:
         now = time.time()
         self._next_heartbeat_at = now + float(self.heartbeat_seconds)
         if self.agent_token:
+            logger.info(
+                "Sending runtime heartbeat agent_id=%s backend_url=%s next_due_in=%ss",
+                self.agent_id,
+                self.backend_url,
+                self.heartbeat_seconds,
+            )
             payload = {
                 "status": "ok",
                 "config_sha256": cfg_sha,
@@ -677,12 +683,19 @@ class AgentRuntime:
             self.status["registered"] = True
             self.status["last_heartbeat_at"] = time.time()
             self.status["paired"] = True
+            logger.info("Runtime heartbeat accepted agent_id=%s", self.agent_id)
             return
 
         # Legacy mode: heartbeat is available only with AGENT_API_TOKEN/SS14_API_TOKEN.
         if not self.api_token or self._legacy_auth_disabled:
             return
 
+        logger.info(
+            "Sending legacy heartbeat agent_id=%s backend_url=%s next_due_in=%ss",
+            self.agent_id,
+            self.backend_url,
+            self.heartbeat_seconds,
+        )
         payload = {
             "agent_id": self.agent_id,
             "status": "ok",
@@ -710,11 +723,18 @@ class AgentRuntime:
             return
         res.raise_for_status()
         self.status["last_heartbeat_at"] = time.time()
+        logger.info("Legacy heartbeat accepted agent_id=%s", self.agent_id)
 
     def _pull(self) -> tuple[list[dict[str, Any]], float]:
         request_timeout = max(self.timeout, self.instruction_wait_seconds + 5)
         wait_seconds = max(0, int(self.instruction_wait_seconds))
         if self.agent_token:
+            logger.info(
+                "Polling master for instructions agent_id=%s limit=%s wait_seconds=%s",
+                self.agent_id,
+                self.instruction_limit,
+                wait_seconds,
+            )
             res = requests.get(
                 f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions",
                 params={"limit": int(self.instruction_limit), "wait_seconds": wait_seconds},
@@ -731,12 +751,24 @@ class AgentRuntime:
             self.status["last_instruction_count"] = len(items)
             next_poll_seconds = float(data.get("next_poll_seconds") or 0)
             self.status["last_pull_next_poll_seconds"] = next_poll_seconds
+            logger.info(
+                "Master poll completed agent_id=%s instructions=%s next_poll_seconds=%s",
+                self.agent_id,
+                len(items),
+                next_poll_seconds,
+            )
             return items, next_poll_seconds
 
         # Legacy mode: pull is available only with AGENT_API_TOKEN/SS14_API_TOKEN.
         if not self.api_token or self._legacy_auth_disabled:
             return [], float(self.poll_seconds)
 
+        logger.info(
+            "Polling master for instructions via legacy auth agent_id=%s limit=%s wait_seconds=%s",
+            self.agent_id,
+            self.instruction_limit,
+            wait_seconds,
+        )
         res = requests.get(
             f"{self.backend_url}/api/agent/instructions/{self.agent_id}",
             params={"limit": int(self.instruction_limit), "wait_seconds": wait_seconds},
@@ -754,6 +786,12 @@ class AgentRuntime:
         self.status["last_instruction_count"] = len(items)
         next_poll_seconds = float(data.get("next_poll_seconds") or 0)
         self.status["last_pull_next_poll_seconds"] = next_poll_seconds
+        logger.info(
+            "Legacy master poll completed agent_id=%s instructions=%s next_poll_seconds=%s",
+            self.agent_id,
+            len(items),
+            next_poll_seconds,
+        )
         return items, next_poll_seconds
 
     def _ack(self, instruction_id: str, ok: bool, result: dict[str, Any] | None = None, error: str | None = None) -> None:

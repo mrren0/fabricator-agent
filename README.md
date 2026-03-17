@@ -26,7 +26,7 @@ curl -sS http://127.0.0.1:8010/status
 
 ```bash
 sudo apt update
-sudo apt install -y git
+sudo apt install -y git jq
 cd ~
 if [ ! -d ~/fabricator-agent/.git ]; then
   git clone https://github.com/ren0san/fabricator-agent.git ~/fabricator-agent
@@ -34,12 +34,19 @@ fi
 cd ~/fabricator-agent
 git remote set-url origin https://github.com/ren0san/fabricator-agent.git
 git remote -v
-git fetch --all --prune
+git fetch origin --prune
 git checkout main
-git reset --hard origin/main
+git pull --ff-only origin main
 git log -1 --oneline
 grep -n "FABRICATOR_AGENT_SOURCE_REPO" agent_main.py
 grep -n "last_instruction_id" agent_main.py
+
+# Fix stale root-owned debhelper artifacts from previous package builds.
+sudo chown -R "$USER":"$USER" debian
+find debian -type d -exec chmod u+rwx {} \;
+find debian -type f -exec chmod u+rw {} \;
+rm -f ../fabricator-agent_*_all.deb
+
 dpkg-buildpackage -us -uc -b
 sudo apt-get install -y --reinstall ../fabricator-agent_*_all.deb
 sudo systemctl daemon-reload
@@ -50,7 +57,18 @@ systemctl status fabricator-agent --no-pager || true
 curl -sS http://127.0.0.1:8010/status | jq
 grep -n "FABRICATOR_AGENT_SOURCE_REPO" /opt/fabricator-agent/agent_main.py
 grep -n "last_instruction_id" /opt/fabricator-agent/agent_main.py
-journalctl -u fabricator-agent -n 50 --no-pager
+sudo journalctl -u fabricator-agent -n 50 --no-pager
+```
+
+If `dpkg-buildpackage` still fails with `Permission denied` under `debian/.debhelper`, remove generated packaging artifacts and rebuild:
+
+```bash
+cd ~/fabricator-agent
+sudo rm -rf debian/.debhelper debian/fabricator-agent debian/files debian/substvars
+sudo chown -R "$USER":"$USER" .
+rm -f ../fabricator-agent_*_all.deb
+dpkg-buildpackage -us -uc -b
+sudo apt-get install -y --reinstall ../fabricator-agent_*_all.deb
 ```
 
 ## Complete Uninstall (Ubuntu)
@@ -108,9 +126,11 @@ sudo systemctl restart fabricator-agent
 Remote-only default behavior:
 
 - if `AGENT_LOCAL_API_URL` is empty, the agent tries `http://127.0.0.1:8000`
+- `/status` exposes runtime state including `last_instruction_id`, pull/config sync timestamps, and current supported instruction kinds
 - `AGENT_LOG_LEVEL` controls instruction execution logs in `journalctl -u fabricator-agent` (`INFO` by default)
 - if `AGENT_LOCAL_API_URL` points to control-plane instead of local edge API, restart/update/stop instructions are rejected with explicit log error to prevent false `ok` acks
 - self-update always restarts only `fabricator-agent` service
+- self-update reports `source_repo`/`source_branch` metadata to the backend when provided by the instruction payload
 - self-update command is rejected if it tries to restart any systemd unit other than `fabricator-agent(.service)`
 - the core control plane talks to the agent via outbound long-poll + ack; no public inbound agent port is required
 - `AGENT_INSTRUCTION_WAIT_SECONDS` controls long-poll hold time on master instruction queue
