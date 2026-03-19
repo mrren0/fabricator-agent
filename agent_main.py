@@ -293,16 +293,83 @@ def _finalize_self_update_command(cmd: str, *, restart_enabled: bool) -> str:
     return f"{base} && systemctl restart {service}"
 
 
-def _detached_popen(cmd: str, *, env: dict[str, str]) -> subprocess.Popen[str]:
-    return subprocess.Popen(
-        ["/bin/sh", "-lc", cmd],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        env=env,
-        text=True,
-        start_new_session=True,
-    )
+def _pid_is_running(pid: int | None) -> bool:
+    value = int(pid or 0)
+    if value <= 0:
+        return False
+    try:
+        os.kill(value, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+    return True
+
+
+def _resolve_self_update_paths() -> tuple[Path, Path]:
+    base_dir = Path(_env("AGENT_SELF_UPDATE_STATE_DIR", "/var/lib/fabricator-agent") or "/var/lib/fabricator-agent")
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        base_dir = Path("/tmp/fabricator-agent")
+        base_dir.mkdir(parents=True, exist_ok=True)
+    log_path = Path(_env("AGENT_SELF_UPDATE_LOG_PATH", str(base_dir / "self-update.log")) or (base_dir / "self-update.log"))
+    state_path = Path(_env("AGENT_SELF_UPDATE_STATUS_PATH", str(base_dir / "self-update-status.json")) or (base_dir / "self-update-status.json"))
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return log_path, state_path
+
+
+def _detached_popen(cmd: str, *, env: dict[str, str], log_path: Path | None = None) -> subprocess.Popen[Any]:
+    stdout_target: Any = subprocess.DEVNULL
+    stderr_target: Any = subprocess.DEVNULL
+    log_file = None
+    if log_path:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = open(log_path, "ab")
+            header = (
+                f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"self-update launch pid=? command={cmd}\n"
+            )
+            log_file.write(header.encode("utf-8", errors="ignore"))
+            log_file.flush()
+            stdout_target = log_file
+            stderr_target = log_file
+        except Exception:
+            if log_file:
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
+            log_file = None
+            stdout_target = subprocess.DEVNULL
+            stderr_target = subprocess.DEVNULL
+    try:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-lc", cmd],
+            stdout=stdout_target,
+            stderr=stderr_target,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            text=False,
+            start_new_session=True,
+        )
+    finally:
+        if log_file:
+            try:
+                log_file.close()
+            except Exception:
+                pass
+    return proc
 
 
 def _run_git(*args: str) -> str | None:
@@ -1349,10 +1416,63 @@ class AgentRuntime:
             env["FABRICATOR_AGENT_TARGET_BUILD"] or "-",
         )
         if restart_enabled:
+            log_path, state_path = _resolve_self_update_paths()
+            existing: dict[str, Any] = {}
             try:
-                proc = _detached_popen(cmd, env=env)
+                if state_path.is_file():
+                    loaded = json.loads(state_path.read_text(encoding="utf-8", errors="ignore"))
+                    if isinstance(loaded, dict):
+                        existing = loaded
+            except Exception:
+                existing = {}
+            existing_pid = int(existing.get("pid") or 0)
+            if _pid_is_running(existing_pid):
+                logger.warning(
+                    "Self-update already running pid=%s state_path=%s log_path=%s",
+                    existing_pid,
+                    state_path,
+                    log_path,
+                )
+                return (
+                    True,
+                    {
+                        "mode": "detached-already-running",
+                        "pid": existing_pid,
+                        "state_path": str(state_path),
+                        "log_path": str(log_path),
+                        "command": str(existing.get("command") or ""),
+                        "restart": True,
+                        "restart_service": _self_update_service_name(),
+                        "note": "self-update process already running",
+                    },
+                    None,
+                )
+            try:
+                proc = _detached_popen(cmd, env=env, log_path=log_path)
             except Exception as exc:
                 return False, {}, f"failed to start detached self-update: {exc}"
+            state_payload = {
+                "pid": int(proc.pid),
+                "started_at": time.time(),
+                "restart": True,
+                "command": cmd,
+                "base_command": base_cmd,
+                "source_repo": env["FABRICATOR_AGENT_SOURCE_REPO"] or None,
+                "source_branch": env["FABRICATOR_AGENT_SOURCE_BRANCH"] or None,
+                "target_version": env["FABRICATOR_AGENT_TARGET_VERSION"] or None,
+                "target_build": env["FABRICATOR_AGENT_TARGET_BUILD"] or None,
+                "log_path": str(log_path),
+            }
+            try:
+                state_path.write_text(json.dumps(state_payload, ensure_ascii=True, sort_keys=True), encoding="utf-8")
+            except Exception:
+                logger.exception("Failed to persist self-update state path=%s", state_path)
+            logger.info(
+                "Self-update detached process started pid=%s state_path=%s log_path=%s",
+                int(proc.pid),
+                state_path,
+                log_path,
+            )
             return (
                 True,
                 {
@@ -1366,6 +1486,8 @@ class AgentRuntime:
                     "source_branch": env["FABRICATOR_AGENT_SOURCE_BRANCH"] or None,
                     "target_version": env["FABRICATOR_AGENT_TARGET_VERSION"] or None,
                     "target_build": env["FABRICATOR_AGENT_TARGET_BUILD"] or None,
+                    "state_path": str(state_path),
+                    "log_path": str(log_path),
                     "note": "self-update scheduled; agent restart may interrupt further logs",
                 },
                 None,
