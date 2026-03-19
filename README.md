@@ -2,6 +2,10 @@
 
 Minimal remote agent used by Fabricator core.
 
+## Update Marker
+
+`marker-2026-03-19-self-update-smoke-v1`
+
 ## Install (Ubuntu)
 
 ```bash
