@@ -3011,6 +3011,77 @@ class AgentRuntime:
         tail = " | ".join(errors[-4:]) if errors else "no candidates"
         return False, {"service_candidates": candidates}, f"watchdog systemd restart failed: {tail}"
 
+    def _execute_watchdog_service_stop(
+        self,
+        *,
+        instruction_id: str,
+        kind: str,
+        slug: str,
+    ) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            return False, {}, "payload.slug is required"
+        base = f"SS14.Watchdog-{slug_norm}"
+        candidates: list[str] = [
+            base,
+            f"{base}.service",
+            f"ss14-watchdog-{slug_norm}",
+            f"ss14-watchdog-{slug_norm}.service",
+        ]
+        extra = self._embedded_guess_watchdog_services(base)
+        for item in extra:
+            name = str(item or "").strip()
+            if name and name not in candidates:
+                candidates.append(name)
+        errors: list[str] = []
+        for unit in candidates:
+            logger.info(
+                "Executing instruction id=%s kind=%s slug=%s via systemctl stop %s",
+                instruction_id,
+                kind,
+                slug_norm,
+                unit,
+            )
+            try:
+                proc = subprocess.run(
+                    ["systemctl", "stop", unit],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            except Exception as exc:
+                errors.append(f"{unit}: {exc}")
+                continue
+            output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            if proc.returncode != 0:
+                errors.append(f"{unit}: rc={proc.returncode} out={output[-600:] if output else '-'}")
+                continue
+            active = "unknown"
+            try:
+                active_proc = subprocess.run(
+                    ["systemctl", "is-active", unit],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                active = str((active_proc.stdout or "").strip() or (active_proc.stderr or "").strip() or "unknown")
+            except Exception:
+                pass
+            return (
+                True,
+                {
+                    "status_code": 200,
+                    "service": unit,
+                    "service_active": active,
+                    "command": f"systemctl stop {unit}",
+                },
+                None,
+            )
+        tail = " | ".join(errors[-4:]) if errors else "no candidates"
+        return False, {"service_candidates": candidates}, f"watchdog systemd stop failed: {tail}"
+
     def _execute_instruction(self, item: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
         kind = str(item.get("kind") or "").strip().lower()
         payload = item.get("payload") or {}
@@ -3073,6 +3144,32 @@ class AgentRuntime:
                 )
             if ok:
                 return True, result, None
+            if kind == "stop-instance" and _env_bool("AGENT_WATCHDOG_STOP_SYSTEMCTL_FALLBACK", True):
+                stop_ok, stop_result, stop_error = self._execute_watchdog_service_stop(
+                    instruction_id=instruction_id,
+                    kind=kind,
+                    slug=slug,
+                )
+                if stop_ok:
+                    merged = dict(stop_result or {})
+                    merged["fallback"] = "systemctl-stop"
+                    merged["watchdog_http_error"] = error
+                    merged["watchdog_http_result"] = result
+                    logger.warning(
+                        "Instruction id=%s kind=%s slug=%s direct watchdog HTTP failed; systemctl stop fallback succeeded",
+                        instruction_id,
+                        kind,
+                        slug or "-",
+                    )
+                    return True, merged, None
+                logger.warning(
+                    "Instruction id=%s kind=%s slug=%s direct watchdog HTTP failed; systemctl stop fallback also failed: %s result=%s",
+                    instruction_id,
+                    kind,
+                    slug or "-",
+                    str(stop_error or "-"),
+                    _log_tail(stop_result or {}),
+                )
             logger.warning(
                 "Instruction id=%s kind=%s slug=%s direct watchdog path failed; fallback to local API. error=%s result=%s",
                 instruction_id,
