@@ -1553,6 +1553,10 @@ class AgentRuntime:
             port_max = int(_env("SS14_PORT_MAX", "2211") or "2211")
         except Exception as exc:
             raise RuntimeError(f"invalid SS14_PORT_MIN/SS14_PORT_MAX: {exc}")
+        if port_min <= 0 or port_max <= 0:
+            raise RuntimeError("SS14_PORT_MIN/SS14_PORT_MAX must be positive integers")
+        if port_min > port_max:
+            port_min, port_max = port_max, port_min
 
         used_ports: set[int] = set()
         for cfg_file in instances_dir.glob("*/config.toml"):
@@ -1573,12 +1577,18 @@ class AgentRuntime:
                         break
             except Exception:
                 continue
-        start = requested_port if requested_port not in (0, 1) else port_min
+        requested = int(requested_port or 0)
+        if requested not in (0, 1):
+            if requested < 1 or requested > 65535:
+                raise RuntimeError(f"requested port {requested} is outside valid range 1..65535")
+            if requested in used_ports or not self._embedded_is_port_free(requested):
+                raise RuntimeError(f"requested port {requested} is already in use")
+            return requested
         return self._embedded_pick_port(
-            start=max(int(start), port_min),
+            start=port_min,
             stop=port_max,
             used_ports=used_ports,
-            error_message=f"No free ports available in range {max(int(start), port_min)}..{port_max}",
+            error_message=f"No free ports available in range {port_min}..{port_max}",
         )
 
     def _embedded_allocate_watchdog_port(
@@ -1593,6 +1603,10 @@ class AgentRuntime:
             port_max = int(_env("SS14_WD_PORT_MAX", "8999") or "8999")
         except Exception as exc:
             raise RuntimeError(f"invalid SS14_WD_PORT_MIN/SS14_WD_PORT_MAX: {exc}")
+        if port_min <= 0 or port_max <= 0:
+            raise RuntimeError("SS14_WD_PORT_MIN/SS14_WD_PORT_MAX must be positive integers")
+        if port_min > port_max:
+            port_min, port_max = port_max, port_min
 
         used_ports: set[int] = set()
         for root in [template_root, *sorted(dedicated_base.glob(f"{template_root.name}-*"))]:
@@ -1614,12 +1628,18 @@ class AgentRuntime:
         if forbidden_ports:
             used_ports.update(int(port) for port in forbidden_ports if int(port) > 0)
 
-        start = requested_port if requested_port not in (0, 1) else port_min
+        requested = int(requested_port or 0)
+        if requested not in (0, 1):
+            if requested < 1 or requested > 65535:
+                raise RuntimeError(f"requested watchdog port {requested} is outside valid range 1..65535")
+            if requested in used_ports or not self._embedded_is_port_free(requested):
+                raise RuntimeError(f"requested watchdog port {requested} is already in use")
+            return requested
         return self._embedded_pick_port(
-            start=max(int(start), port_min),
+            start=port_min,
             stop=port_max,
             used_ports=used_ports,
-            error_message=f"No free watchdog ports available in range {max(int(start), port_min)}..{port_max}",
+            error_message=f"No free watchdog ports available in range {port_min}..{port_max}",
         )
 
     def _embedded_is_port_free(self, port: int) -> bool:
