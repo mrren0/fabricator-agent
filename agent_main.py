@@ -381,6 +381,14 @@ class AgentRuntime:
             "last_register_at": None,
             "last_heartbeat_at": None,
             "last_pull_at": None,
+            "last_pull_started_at": None,
+            "last_pull_completed_at": None,
+            "last_pull_duration_ms": None,
+            "last_pull_wait_seconds": float(self.instruction_wait_seconds),
+            "last_pull_timeout_seconds": None,
+            "last_pull_http_status": None,
+            "last_pull_mode": None,
+            "last_pull_instruction_ids": [],
             "last_instruction_count": 0,
             "last_instruction_id": None,
             "last_instruction_kind": None,
@@ -389,6 +397,25 @@ class AgentRuntime:
             "last_instruction_error": None,
             "last_instruction_result": None,
             "last_pull_next_poll_seconds": None,
+            "last_ack_at": None,
+            "last_ack_instruction_id": None,
+            "last_ack_instruction_kind": None,
+            "last_ack_ok": None,
+            "last_ack_http_status": None,
+            "last_ack_duration_ms": None,
+            "last_ack_error": None,
+            "last_progress_at": None,
+            "last_progress_instruction_id": None,
+            "last_progress_execution_state": None,
+            "last_progress_stage": None,
+            "last_progress_http_status": None,
+            "last_progress_duration_ms": None,
+            "last_progress_error": None,
+            "loop_cycle_seq": 0,
+            "last_cycle_started_at": None,
+            "last_cycle_completed_at": None,
+            "last_cycle_duration_ms": None,
+            "last_cycle_sleep_seconds": None,
             "instruction_limit": self.instruction_limit,
             "config_sha256": None,
             "last_config_snapshot_sync_at": None,
@@ -404,6 +431,7 @@ class AgentRuntime:
         }
         self._next_heartbeat_at = 0.0
         self._next_config_sync_at = 0.0
+        self._cycle_seq = 0
         self._config_snapshot_hashes: dict[str, str] = {}
         self._load_token_file()
         self._embedded_reconcile_watchdog_services()
@@ -728,6 +756,20 @@ class AgentRuntime:
     def _pull(self) -> tuple[list[dict[str, Any]], float]:
         request_timeout = max(self.timeout, self.instruction_wait_seconds + 5)
         wait_seconds = max(0, int(self.instruction_wait_seconds))
+        pull_started_at = time.time()
+        pull_started_monotonic = time.monotonic()
+        pull_mode = "runtime" if self.agent_token else "legacy"
+        self.status["last_pull_started_at"] = pull_started_at
+        self.status["last_pull_mode"] = pull_mode
+        self.status["last_pull_wait_seconds"] = float(wait_seconds)
+        self.status["last_pull_timeout_seconds"] = float(request_timeout)
+        logger.info(
+            "Instruction pull start mode=%s wait_seconds=%s limit=%s timeout_seconds=%s",
+            pull_mode,
+            wait_seconds,
+            int(self.instruction_limit),
+            request_timeout,
+        )
         if self.agent_token:
             logger.info(
                 "Polling master for instructions agent_id=%s limit=%s wait_seconds=%s",
@@ -741,26 +783,56 @@ class AgentRuntime:
                 headers=self._runtime_headers(),
                 timeout=request_timeout,
             )
+            self.status["last_pull_http_status"] = int(res.status_code)
             if res.status_code == 401:
                 self._invalidate_runtime_token("Runtime token rejected while pulling; re-enrolling")
+                elapsed_ms = (time.monotonic() - pull_started_monotonic) * 1000.0
+                self.status["last_pull_completed_at"] = time.time()
+                self.status["last_pull_duration_ms"] = round(elapsed_ms, 3)
+                self.status["last_pull_instruction_ids"] = []
+                logger.warning(
+                    "Instruction pull unauthorized mode=%s status_code=%s elapsed_ms=%.1f",
+                    pull_mode,
+                    res.status_code,
+                    elapsed_ms,
+                )
                 return [], float(self.poll_seconds)
             res.raise_for_status()
             data = res.json() if res.content else {}
             self.status["last_pull_at"] = time.time()
             items = data.get("instructions") or []
+            instruction_ids = [str((item or {}).get("id") or "").strip() for item in items]
+            instruction_ids = [iid for iid in instruction_ids if iid]
             self.status["last_instruction_count"] = len(items)
             next_poll_seconds = float(data.get("next_poll_seconds") or 0)
             self.status["last_pull_next_poll_seconds"] = next_poll_seconds
+            elapsed_ms = (time.monotonic() - pull_started_monotonic) * 1000.0
+            self.status["last_pull_completed_at"] = time.time()
+            self.status["last_pull_duration_ms"] = round(elapsed_ms, 3)
+            self.status["last_pull_instruction_ids"] = instruction_ids
             logger.info(
-                "Master poll completed agent_id=%s instructions=%s next_poll_seconds=%s",
-                self.agent_id,
+                "Instruction pull done mode=%s status_code=%s elapsed_ms=%.1f instruction_count=%s next_poll_seconds=%s instruction_ids=%s",
+                pull_mode,
+                res.status_code,
+                elapsed_ms,
                 len(items),
                 next_poll_seconds,
+                ",".join(instruction_ids) if instruction_ids else "-",
             )
             return items, next_poll_seconds
 
         # Legacy mode: pull is available only with AGENT_API_TOKEN/SS14_API_TOKEN.
         if not self.api_token or self._legacy_auth_disabled:
+            elapsed_ms = (time.monotonic() - pull_started_monotonic) * 1000.0
+            self.status["last_pull_completed_at"] = time.time()
+            self.status["last_pull_duration_ms"] = round(elapsed_ms, 3)
+            self.status["last_pull_http_status"] = None
+            self.status["last_pull_instruction_ids"] = []
+            logger.info(
+                "Instruction pull skipped mode=legacy reason=%s elapsed_ms=%.1f",
+                "legacy_auth_unavailable",
+                elapsed_ms,
+            )
             return [], float(self.poll_seconds)
 
         logger.info(
@@ -775,65 +847,255 @@ class AgentRuntime:
             headers=self._headers(),
             timeout=request_timeout,
         )
+        self.status["last_pull_http_status"] = int(res.status_code)
         if res.status_code == 401:
             self._legacy_auth_disabled = True
             self.status["legacy_auth_disabled"] = True
+            elapsed_ms = (time.monotonic() - pull_started_monotonic) * 1000.0
+            self.status["last_pull_completed_at"] = time.time()
+            self.status["last_pull_duration_ms"] = round(elapsed_ms, 3)
+            self.status["last_pull_instruction_ids"] = []
+            logger.warning(
+                "Instruction pull unauthorized mode=%s status_code=%s elapsed_ms=%.1f",
+                pull_mode,
+                res.status_code,
+                elapsed_ms,
+            )
             return [], float(self.poll_seconds)
         res.raise_for_status()
         data = res.json() if res.content else {}
         self.status["last_pull_at"] = time.time()
         items = data.get("instructions") or []
+        instruction_ids = [str((item or {}).get("id") or "").strip() for item in items]
+        instruction_ids = [iid for iid in instruction_ids if iid]
         self.status["last_instruction_count"] = len(items)
         next_poll_seconds = float(data.get("next_poll_seconds") or 0)
         self.status["last_pull_next_poll_seconds"] = next_poll_seconds
+        elapsed_ms = (time.monotonic() - pull_started_monotonic) * 1000.0
+        self.status["last_pull_completed_at"] = time.time()
+        self.status["last_pull_duration_ms"] = round(elapsed_ms, 3)
+        self.status["last_pull_instruction_ids"] = instruction_ids
         logger.info(
-            "Legacy master poll completed agent_id=%s instructions=%s next_poll_seconds=%s",
-            self.agent_id,
+            "Instruction pull done mode=%s status_code=%s elapsed_ms=%.1f instruction_count=%s next_poll_seconds=%s instruction_ids=%s",
+            pull_mode,
+            res.status_code,
+            elapsed_ms,
             len(items),
             next_poll_seconds,
+            ",".join(instruction_ids) if instruction_ids else "-",
         )
         return items, next_poll_seconds
 
-    def _ack(self, instruction_id: str, ok: bool, result: dict[str, Any] | None = None, error: str | None = None) -> None:
+    def _ack(
+        self,
+        instruction_id: str,
+        ok: bool,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+        *,
+        instruction_kind: str | None = None,
+    ) -> None:
         payload = {"ok": bool(ok), "result": result or {}, "error": error}
+        mode = "runtime" if self.agent_token else "legacy"
+        started_monotonic = time.monotonic()
+        self.status["last_ack_instruction_id"] = instruction_id or None
+        self.status["last_ack_instruction_kind"] = str(instruction_kind or "").strip().lower() or None
+        self.status["last_ack_ok"] = bool(ok)
+        self.status["last_ack_error"] = str(error or "").strip() or None
+        logger.info(
+            "Instruction ack send id=%s kind=%s mode=%s ok=%s",
+            instruction_id or "-",
+            self.status["last_ack_instruction_kind"] or "-",
+            mode,
+            bool(ok),
+        )
         if self.agent_token:
-            res = self._post_with_retries(
-                f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions/{instruction_id}/ack",
-                json=payload,
-                headers=self._runtime_headers(),
-            )
+            try:
+                res = self._post_with_retries(
+                    f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions/{instruction_id}/ack",
+                    json=payload,
+                    headers=self._runtime_headers(),
+                )
+            except Exception as exc:
+                elapsed_ms = (time.monotonic() - started_monotonic) * 1000.0
+                self.status["last_ack_http_status"] = None
+                self.status["last_ack_duration_ms"] = round(elapsed_ms, 3)
+                self.status["last_ack_at"] = time.time()
+                self.status["last_ack_error"] = str(exc)
+                logger.exception(
+                    "Instruction ack transport failed id=%s kind=%s mode=%s elapsed_ms=%.1f",
+                    instruction_id or "-",
+                    self.status["last_ack_instruction_kind"] or "-",
+                    mode,
+                    elapsed_ms,
+                )
+                raise
+            self.status["last_ack_http_status"] = int(res.status_code)
             if res.status_code == 401:
                 self._invalidate_runtime_token("Runtime token rejected while ack; re-enrolling")
+                elapsed_ms = (time.monotonic() - started_monotonic) * 1000.0
+                self.status["last_ack_duration_ms"] = round(elapsed_ms, 3)
+                self.status["last_ack_at"] = time.time()
+                self.status["last_ack_error"] = "401 unauthorized"
+                logger.warning(
+                    "Instruction ack unauthorized id=%s kind=%s mode=%s status_code=%s elapsed_ms=%.1f",
+                    instruction_id or "-",
+                    self.status["last_ack_instruction_kind"] or "-",
+                    mode,
+                    res.status_code,
+                    elapsed_ms,
+                )
                 return
-            res.raise_for_status()
+            try:
+                res.raise_for_status()
+            except Exception:
+                elapsed_ms = (time.monotonic() - started_monotonic) * 1000.0
+                self.status["last_ack_duration_ms"] = round(elapsed_ms, 3)
+                self.status["last_ack_at"] = time.time()
+                self.status["last_ack_error"] = f"http {res.status_code}"
+                logger.exception(
+                    "Instruction ack rejected id=%s kind=%s mode=%s status_code=%s elapsed_ms=%.1f",
+                    instruction_id or "-",
+                    self.status["last_ack_instruction_kind"] or "-",
+                    mode,
+                    res.status_code,
+                    elapsed_ms,
+                )
+                raise
+            elapsed_ms = (time.monotonic() - started_monotonic) * 1000.0
+            self.status["last_ack_duration_ms"] = round(elapsed_ms, 3)
+            self.status["last_ack_at"] = time.time()
+            self.status["last_ack_error"] = None
+            logger.info(
+                "Instruction ack confirmed id=%s kind=%s mode=%s status_code=%s elapsed_ms=%.1f",
+                instruction_id or "-",
+                self.status["last_ack_instruction_kind"] or "-",
+                mode,
+                res.status_code,
+                elapsed_ms,
+            )
             return
         if self._legacy_auth_disabled:
+            elapsed_ms = (time.monotonic() - started_monotonic) * 1000.0
+            self.status["last_ack_http_status"] = None
+            self.status["last_ack_duration_ms"] = round(elapsed_ms, 3)
+            self.status["last_ack_at"] = time.time()
+            self.status["last_ack_error"] = "legacy auth disabled"
+            logger.warning(
+                "Instruction ack skipped id=%s kind=%s mode=%s reason=%s elapsed_ms=%.1f",
+                instruction_id or "-",
+                self.status["last_ack_instruction_kind"] or "-",
+                mode,
+                "legacy_auth_disabled",
+                elapsed_ms,
+            )
             return
-        res = self._post_with_retries(
-            f"{self.backend_url}/api/agent/instructions/{self.agent_id}/{instruction_id}/ack",
-            json=payload,
-            headers=self._headers(),
-        )
+        try:
+            res = self._post_with_retries(
+                f"{self.backend_url}/api/agent/instructions/{self.agent_id}/{instruction_id}/ack",
+                json=payload,
+                headers=self._headers(),
+            )
+        except Exception as exc:
+            elapsed_ms = (time.monotonic() - started_monotonic) * 1000.0
+            self.status["last_ack_http_status"] = None
+            self.status["last_ack_duration_ms"] = round(elapsed_ms, 3)
+            self.status["last_ack_at"] = time.time()
+            self.status["last_ack_error"] = str(exc)
+            logger.exception(
+                "Instruction ack transport failed id=%s kind=%s mode=%s elapsed_ms=%.1f",
+                instruction_id or "-",
+                self.status["last_ack_instruction_kind"] or "-",
+                mode,
+                elapsed_ms,
+            )
+            raise
+        self.status["last_ack_http_status"] = int(res.status_code)
         if res.status_code == 401:
             self._legacy_auth_disabled = True
             self.status["legacy_auth_disabled"] = True
+            elapsed_ms = (time.monotonic() - started_monotonic) * 1000.0
+            self.status["last_ack_duration_ms"] = round(elapsed_ms, 3)
+            self.status["last_ack_at"] = time.time()
+            self.status["last_ack_error"] = "401 unauthorized"
+            logger.warning(
+                "Instruction ack unauthorized id=%s kind=%s mode=%s status_code=%s elapsed_ms=%.1f",
+                instruction_id or "-",
+                self.status["last_ack_instruction_kind"] or "-",
+                mode,
+                res.status_code,
+                elapsed_ms,
+            )
             return
-        res.raise_for_status()
+        try:
+            res.raise_for_status()
+        except Exception:
+            elapsed_ms = (time.monotonic() - started_monotonic) * 1000.0
+            self.status["last_ack_duration_ms"] = round(elapsed_ms, 3)
+            self.status["last_ack_at"] = time.time()
+            self.status["last_ack_error"] = f"http {res.status_code}"
+            logger.exception(
+                "Instruction ack rejected id=%s kind=%s mode=%s status_code=%s elapsed_ms=%.1f",
+                instruction_id or "-",
+                self.status["last_ack_instruction_kind"] or "-",
+                mode,
+                res.status_code,
+                elapsed_ms,
+            )
+            raise
+        elapsed_ms = (time.monotonic() - started_monotonic) * 1000.0
+        self.status["last_ack_duration_ms"] = round(elapsed_ms, 3)
+        self.status["last_ack_at"] = time.time()
+        self.status["last_ack_error"] = None
+        logger.info(
+            "Instruction ack confirmed id=%s kind=%s mode=%s status_code=%s elapsed_ms=%.1f",
+            instruction_id or "-",
+            self.status["last_ack_instruction_kind"] or "-",
+            mode,
+            res.status_code,
+            elapsed_ms,
+        )
 
     def _post_with_retries(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> requests.Response:
         last_exc: requests.RequestException | None = None
         for attempt in range(self.runtime_post_retries):
             try:
-                return requests.post(
+                res = requests.post(
                     url,
                     json=json,
                     headers=headers,
                     timeout=self.timeout,
                 )
+                if attempt > 0:
+                    logger.info(
+                        "HTTP POST recovered after retry url=%s attempt=%s/%s status_code=%s",
+                        url,
+                        attempt + 1,
+                        self.runtime_post_retries,
+                        res.status_code,
+                    )
+                return res
             except requests.RequestException as exc:
                 last_exc = exc
                 if attempt + 1 < self.runtime_post_retries:
-                    time.sleep(self.runtime_post_retry_delay * float(attempt + 1))
+                    delay = self.runtime_post_retry_delay * float(attempt + 1)
+                    logger.warning(
+                        "HTTP POST failed url=%s attempt=%s/%s retry_in=%.2fs error=%s",
+                        url,
+                        attempt + 1,
+                        self.runtime_post_retries,
+                        delay,
+                        str(exc),
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        "HTTP POST failed url=%s attempt=%s/%s giving_up error=%s",
+                        url,
+                        attempt + 1,
+                        self.runtime_post_retries,
+                        str(exc),
+                    )
         if last_exc:
             raise last_exc
         raise RuntimeError("runtime post failed with unknown error")
@@ -849,20 +1111,86 @@ class AgentRuntime:
     ) -> None:
         if not self.agent_token:
             return
-        res = self._post_with_retries(
-            f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions/{instruction_id}/progress",
-            json={
-                "execution_state": str(execution_state or "").strip().lower(),
-                "stage": str(stage or "").strip().lower() or None,
-                "message": str(message or "").strip() or None,
-                "result": result or None,
-            },
-            headers=self._runtime_headers(),
+        payload = {
+            "execution_state": str(execution_state or "").strip().lower(),
+            "stage": str(stage or "").strip().lower() or None,
+            "message": str(message or "").strip() or None,
+            "result": result or None,
+        }
+        started_monotonic = time.monotonic()
+        self.status["last_progress_instruction_id"] = instruction_id or None
+        self.status["last_progress_execution_state"] = payload.get("execution_state")
+        self.status["last_progress_stage"] = payload.get("stage")
+        logger.info(
+            "Instruction progress send id=%s state=%s stage=%s",
+            instruction_id or "-",
+            payload.get("execution_state") or "-",
+            payload.get("stage") or "-",
         )
+        try:
+            res = self._post_with_retries(
+                f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions/{instruction_id}/progress",
+                json=payload,
+                headers=self._runtime_headers(),
+            )
+        except Exception as exc:
+            elapsed_ms = (time.monotonic() - started_monotonic) * 1000.0
+            self.status["last_progress_http_status"] = None
+            self.status["last_progress_duration_ms"] = round(elapsed_ms, 3)
+            self.status["last_progress_at"] = time.time()
+            self.status["last_progress_error"] = str(exc)
+            logger.exception(
+                "Instruction progress transport failed id=%s state=%s stage=%s elapsed_ms=%.1f",
+                instruction_id or "-",
+                payload.get("execution_state") or "-",
+                payload.get("stage") or "-",
+                elapsed_ms,
+            )
+            raise
+        self.status["last_progress_http_status"] = int(res.status_code)
         if res.status_code == 401:
             self._invalidate_runtime_token("Runtime token rejected while sending progress; re-enrolling")
+            elapsed_ms = (time.monotonic() - started_monotonic) * 1000.0
+            self.status["last_progress_duration_ms"] = round(elapsed_ms, 3)
+            self.status["last_progress_at"] = time.time()
+            self.status["last_progress_error"] = "401 unauthorized"
+            logger.warning(
+                "Instruction progress unauthorized id=%s state=%s stage=%s status_code=%s elapsed_ms=%.1f",
+                instruction_id or "-",
+                payload.get("execution_state") or "-",
+                payload.get("stage") or "-",
+                res.status_code,
+                elapsed_ms,
+            )
             return
-        res.raise_for_status()
+        try:
+            res.raise_for_status()
+        except Exception:
+            elapsed_ms = (time.monotonic() - started_monotonic) * 1000.0
+            self.status["last_progress_duration_ms"] = round(elapsed_ms, 3)
+            self.status["last_progress_at"] = time.time()
+            self.status["last_progress_error"] = f"http {res.status_code}"
+            logger.exception(
+                "Instruction progress rejected id=%s state=%s stage=%s status_code=%s elapsed_ms=%.1f",
+                instruction_id or "-",
+                payload.get("execution_state") or "-",
+                payload.get("stage") or "-",
+                res.status_code,
+                elapsed_ms,
+            )
+            raise
+        elapsed_ms = (time.monotonic() - started_monotonic) * 1000.0
+        self.status["last_progress_duration_ms"] = round(elapsed_ms, 3)
+        self.status["last_progress_at"] = time.time()
+        self.status["last_progress_error"] = None
+        logger.info(
+            "Instruction progress confirmed id=%s state=%s stage=%s status_code=%s elapsed_ms=%.1f",
+            instruction_id or "-",
+            payload.get("execution_state") or "-",
+            payload.get("stage") or "-",
+            res.status_code,
+            elapsed_ms,
+        )
 
     def _enroll_request(self) -> None:
         payload = {
@@ -2416,6 +2744,219 @@ class AgentRuntime:
         if not token or not secrets.compare_digest(token, expected):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent admin token")
 
+    def _resolve_watchdog_api_base_url(self, slug: str) -> tuple[str, str]:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            return "", "missing-slug"
+        template_root, _, wd_root = self._embedded_watchdog_layout(slug_norm)
+        candidates = [
+            wd_root / "appsettings.yml",
+            wd_root / "appsettings.base.yml",
+            template_root / "appsettings.yml",
+            template_root / "appsettings.base.yml",
+        ]
+        patterns = [
+            re.compile(r"^\s*BaseUrl\s*:\s*\"?([^\"\s]+)\"?\s*$", re.IGNORECASE),
+            re.compile(r"^\s*Urls\s*:\s*\"?([^\"\s]+)\"?\s*$", re.IGNORECASE),
+        ]
+        for appsettings_path in candidates:
+            try:
+                if not appsettings_path.is_file():
+                    continue
+                for line in appsettings_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    value = ""
+                    for pattern in patterns:
+                        match = pattern.match(line)
+                        if match:
+                            value = str(match.group(1) or "").strip()
+                            break
+                    if not value:
+                        continue
+                    parsed = urlparse(value if "://" in value else f"http://{value}")
+                    if parsed.scheme and parsed.netloc:
+                        return f"{parsed.scheme}://{parsed.netloc}".rstrip("/"), str(appsettings_path)
+            except Exception:
+                logger.exception(
+                    "Failed to parse watchdog appsettings for slug=%s path=%s",
+                    slug_norm,
+                    appsettings_path,
+                )
+        env_url = str(_env("AGENT_WATCHDOG_API_URL") or "").strip()
+        if env_url:
+            parsed = urlparse(env_url if "://" in env_url else f"http://{env_url}")
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}".rstrip("/"), "AGENT_WATCHDOG_API_URL"
+        return "", "not-found"
+
+    def _resolve_watchdog_instance_token(self, slug: str) -> tuple[str, str]:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            return "", "missing-slug"
+        try:
+            cfg_path = self._embedded_instance_config_path(slug_norm)
+        except Exception:
+            cfg_path = None
+        if cfg_path and cfg_path.is_file():
+            try:
+                parsed = tomllib.loads(cfg_path.read_text(encoding="utf-8", errors="ignore"))
+                if isinstance(parsed, dict):
+                    watchdog = parsed.get("watchdog") if isinstance(parsed.get("watchdog"), dict) else {}
+                    token = str((watchdog or {}).get("token") or "").strip()
+                    if token:
+                        return token, str(cfg_path)
+                    loki = parsed.get("loki") if isinstance(parsed.get("loki"), dict) else {}
+                    token = str((loki or {}).get("password") or "").strip()
+                    if token:
+                        return token, f"{cfg_path}#loki.password"
+            except Exception:
+                logger.exception("Failed to parse watchdog token from config slug=%s path=%s", slug_norm, cfg_path)
+        token = _local_api_token(self)
+        if token:
+            return token, "local-api-token-fallback"
+        return "", "not-found"
+
+    def _execute_watchdog_http_action(
+        self,
+        *,
+        instruction_id: str,
+        kind: str,
+        slug: str,
+        action: str,
+        reason: str | None = None,
+    ) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            return False, {}, "payload.slug is required"
+        base_url, base_source = self._resolve_watchdog_api_base_url(slug_norm)
+        if not base_url:
+            return False, {"slug": slug_norm, "source": base_source}, "watchdog API base URL is not configured"
+        token, token_source = self._resolve_watchdog_instance_token(slug_norm)
+        if not token:
+            return False, {"slug": slug_norm, "source": token_source}, "watchdog token is not configured"
+        url = f"{base_url.rstrip('/')}/instances/{slug_norm}/{action}"
+        headers: dict[str, str] = {}
+        reason_text = str(reason or "").strip()
+        if reason_text:
+            headers["X-Reason"] = reason_text
+        logger.info(
+            "Executing instruction id=%s kind=%s slug=%s via POST %s auth_user=%s token_source=%s url_source=%s",
+            instruction_id,
+            kind,
+            slug_norm,
+            url,
+            slug_norm,
+            token_source,
+            base_source,
+        )
+        try:
+            res = requests.post(
+                url,
+                auth=(slug_norm, token),
+                headers=headers or None,
+                timeout=max(5, self.timeout),
+            )
+        except requests.RequestException as exc:
+            logger.error(
+                "Instruction id=%s kind=%s slug=%s watchdog request failed url=%s error=%s",
+                instruction_id,
+                kind,
+                slug_norm,
+                url,
+                exc,
+            )
+            return False, {"watchdog_url": base_url, "url": url}, f"watchdog request failed: {exc}"
+        try:
+            data: Any = res.json()
+        except Exception:
+            data = {"raw": (res.text or "")[-3000:]}
+        ok = res.status_code < 400
+        logger.info(
+            "Instruction id=%s kind=%s slug=%s watchdog response status=%s body=%s",
+            instruction_id,
+            kind,
+            slug_norm,
+            res.status_code,
+            _log_tail(data),
+        )
+        if ok:
+            return True, {"status_code": res.status_code, "response": data, "url": url}, None
+        return (
+            False,
+            {"status_code": res.status_code, "response": data, "watchdog_url": base_url, "url": url},
+            "watchdog api call failed",
+        )
+
+    def _execute_watchdog_service_restart(
+        self,
+        *,
+        instruction_id: str,
+        kind: str,
+        slug: str,
+    ) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            return False, {}, "payload.slug is required"
+        base = f"SS14.Watchdog-{slug_norm}"
+        candidates: list[str] = [
+            base,
+            f"{base}.service",
+            f"ss14-watchdog-{slug_norm}",
+            f"ss14-watchdog-{slug_norm}.service",
+        ]
+        extra = self._embedded_guess_watchdog_services(base)
+        for item in extra:
+            name = str(item or "").strip()
+            if name and name not in candidates:
+                candidates.append(name)
+        errors: list[str] = []
+        for unit in candidates:
+            logger.info(
+                "Executing instruction id=%s kind=%s slug=%s via systemctl restart %s",
+                instruction_id,
+                kind,
+                slug_norm,
+                unit,
+            )
+            try:
+                proc = subprocess.run(
+                    ["systemctl", "restart", unit],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            except Exception as exc:
+                errors.append(f"{unit}: {exc}")
+                continue
+            output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            if proc.returncode != 0:
+                errors.append(f"{unit}: rc={proc.returncode} out={output[-600:] if output else '-'}")
+                continue
+            active = "unknown"
+            try:
+                active_proc = subprocess.run(
+                    ["systemctl", "is-active", unit],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                active = str((active_proc.stdout or "").strip() or (active_proc.stderr or "").strip() or "unknown")
+            except Exception:
+                pass
+            return (
+                True,
+                {
+                    "status_code": 200,
+                    "service": unit,
+                    "service_active": active,
+                    "command": f"systemctl restart {unit}",
+                },
+                None,
+            )
+        tail = " | ".join(errors[-4:]) if errors else "no candidates"
+        return False, {"service_candidates": candidates}, f"watchdog systemd restart failed: {tail}"
+
     def _execute_instruction(self, item: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
         kind = str(item.get("kind") or "").strip().lower()
         payload = item.get("payload") or {}
@@ -2451,6 +2992,40 @@ class AgentRuntime:
             return self._embedded_set_instance_config(
                 str(payload.get("slug") or ""),
                 str(payload.get("content") or ""),
+            )
+        if kind in {"restart-instance", "update-instance", "stop-instance"}:
+            instruction_id = str(item.get("id") or "").strip() or "-"
+            slug = str(payload.get("slug") or "").strip()
+            if kind == "restart-instance":
+                ok, result, error = self._execute_watchdog_service_restart(
+                    instruction_id=instruction_id,
+                    kind=kind,
+                    slug=slug,
+                )
+            elif kind == "update-instance":
+                ok, result, error = self._execute_watchdog_http_action(
+                    instruction_id=instruction_id,
+                    kind=kind,
+                    slug=slug,
+                    action="update",
+                )
+            else:
+                ok, result, error = self._execute_watchdog_http_action(
+                    instruction_id=instruction_id,
+                    kind=kind,
+                    slug=slug,
+                    action="stop",
+                    reason=str(payload.get("reason") or "").strip() or None,
+                )
+            if ok:
+                return True, result, None
+            logger.warning(
+                "Instruction id=%s kind=%s slug=%s direct watchdog path failed; fallback to local API. error=%s result=%s",
+                instruction_id,
+                kind,
+                slug or "-",
+                str(error or "-"),
+                _log_tail(result or {}),
             )
         if kind in {
             "create-instance",
@@ -2562,6 +3137,21 @@ class AgentRuntime:
         while not self._stop.is_set():
             cycle_error: str | None = None
             sleep_seconds = float(self.poll_seconds)
+            self._cycle_seq += 1
+            cycle_seq = int(self._cycle_seq)
+            cycle_started_at = time.time()
+            cycle_started_monotonic = time.monotonic()
+            self.status["loop_cycle_seq"] = cycle_seq
+            self.status["last_cycle_started_at"] = cycle_started_at
+            logger.info(
+                "Agent loop cycle start seq=%s poll_seconds=%s wait_seconds=%s heartbeat_seconds=%s paired=%s has_runtime_token=%s",
+                cycle_seq,
+                self.poll_seconds,
+                self.instruction_wait_seconds,
+                self.heartbeat_seconds,
+                bool(self.status.get("paired")),
+                bool(self.agent_token),
+            )
             try:
                 if not self.agent_token:
                     if not self.status.get("claim_code"):
@@ -2589,13 +3179,27 @@ class AgentRuntime:
                 items, next_poll_seconds = self._pull()
                 self.status["last_instruction_count"] = len(items)
                 sleep_seconds = float(next_poll_seconds if not items else 0.0)
+                logger.info(
+                    "Agent loop cycle pull result seq=%s instruction_count=%s next_poll_seconds=%s sleep_seconds=%s",
+                    cycle_seq,
+                    len(items),
+                    next_poll_seconds,
+                    sleep_seconds,
+                )
                 for item in items:
                     instruction_id = str(item.get("id") or "")
                     instruction_kind = str(item.get("kind") or "").strip().lower() or None
                     logger.info(
-                        "Instruction received id=%s kind=%s payload=%s",
+                        "Instruction received id=%s kind=%s status=%s execution_state=%s stage=%s delivery_count=%s leased_at=%s lease_expires_at=%s status_message=%s payload=%s",
                         instruction_id or "-",
                         instruction_kind or "-",
+                        str(item.get("status") or "-"),
+                        str(item.get("execution_state") or "-"),
+                        str(item.get("stage") or "-"),
+                        int(item.get("delivery_count") or 0),
+                        str(item.get("leased_at") if item.get("leased_at") is not None else "-"),
+                        str(item.get("lease_expires_at") if item.get("lease_expires_at") is not None else "-"),
+                        str(item.get("status_message") or "-"),
                         _log_tail((item or {}).get("payload") or {}),
                     )
                     self.status["last_instruction_id"] = instruction_id or None
@@ -2612,6 +3216,7 @@ class AgentRuntime:
                         except Exception:
                             logger.exception("Instruction progress update failed stage=accepted id=%s", instruction_id)
                     try:
+                        instruction_started_monotonic = time.monotonic()
                         if instruction_id:
                             try:
                                 self._progress(
@@ -2625,6 +3230,7 @@ class AgentRuntime:
                         ok, result, error = self._execute_instruction(item)
                     except Exception as exc:
                         ok, result, error = False, {}, str(exc)
+                    instruction_elapsed_ms = (time.monotonic() - instruction_started_monotonic) * 1000.0
                     if instruction_id and instruction_kind in {"get-instance-config", "set-instance-config"}:
                         try:
                             self._progress(
@@ -2650,10 +3256,11 @@ class AgentRuntime:
                     self.status["last_instruction_error"] = error
                     self.status["last_instruction_result"] = result or {}
                     logger.info(
-                        "Instruction finished id=%s kind=%s ok=%s error=%s result=%s",
+                        "Instruction finished id=%s kind=%s ok=%s duration_ms=%.1f error=%s result=%s",
                         instruction_id or "-",
                         instruction_kind or "-",
                         bool(ok),
+                        instruction_elapsed_ms,
                         str(error or "") or "-",
                         _log_tail(result or {}),
                     )
@@ -2663,7 +3270,13 @@ class AgentRuntime:
                         self._next_config_sync_at = 0.0
                     if instruction_id:
                         try:
-                            self._ack(instruction_id, ok=ok, result=result, error=error)
+                            self._ack(
+                                instruction_id,
+                                ok=ok,
+                                result=result,
+                                error=error,
+                                instruction_kind=instruction_kind,
+                            )
                             logger.info(
                                 "Instruction ack sent id=%s kind=%s ok=%s",
                                 instruction_id,
@@ -2682,9 +3295,28 @@ class AgentRuntime:
                     response = exc.response
                     request_url = getattr(getattr(exc, "request", None), "url", None)
                     self.status["last_error"] = f"{response.status_code} {response.reason}: {request_url or ''}".strip()
+                    logger.warning(
+                        "Agent loop cycle failed seq=%s http_status=%s reason=%s url=%s",
+                        cycle_seq,
+                        response.status_code,
+                        response.reason,
+                        request_url or "-",
+                    )
                 else:
                     self.status["last_error"] = str(exc)
+                    logger.exception("Agent loop cycle failed seq=%s", cycle_seq)
                 sleep_seconds = float(self.poll_seconds)
+            cycle_duration_ms = (time.monotonic() - cycle_started_monotonic) * 1000.0
+            self.status["last_cycle_completed_at"] = time.time()
+            self.status["last_cycle_duration_ms"] = round(cycle_duration_ms, 3)
+            self.status["last_cycle_sleep_seconds"] = max(0.0, float(sleep_seconds))
+            logger.info(
+                "Agent loop cycle end seq=%s duration_ms=%.1f sleep_seconds=%s last_error=%s",
+                cycle_seq,
+                cycle_duration_ms,
+                max(0.0, float(sleep_seconds)),
+                str(self.status.get("last_error") or "-"),
+            )
             self._stop.wait(max(0.0, sleep_seconds))
 
     def start(self) -> None:
