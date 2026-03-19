@@ -2838,8 +2838,24 @@ class AgentRuntime:
         reason_text = str(reason or "").strip()
         if reason_text:
             headers["X-Reason"] = reason_text
+        timeout_default = max(30.0, float(self.timeout))
+        timeout_env_map = {
+            "stop": "AGENT_WATCHDOG_STOP_TIMEOUT_SECONDS",
+            "update": "AGENT_WATCHDOG_UPDATE_TIMEOUT_SECONDS",
+        }
+        timeout_env_name = timeout_env_map.get(action, "AGENT_WATCHDOG_HTTP_TIMEOUT_SECONDS")
+        timeout_seconds = timeout_default
+        try:
+            timeout_seconds = max(5.0, float(_env(timeout_env_name, str(timeout_default)) or str(timeout_default)))
+        except Exception:
+            timeout_seconds = timeout_default
+        curl_preview = f'curl -s -u "{slug_norm}:***" -X POST "{url}"'
+        if reason_text:
+            safe_reason = reason_text.replace('"', '\\"')
+            curl_preview += f' -H "X-Reason: {safe_reason}"'
+        curl_preview += ' -w " -> HTTP %{http_code}\\n"'
         logger.info(
-            "Executing instruction id=%s kind=%s slug=%s via POST %s auth_user=%s token_source=%s url_source=%s",
+            "Executing instruction id=%s kind=%s slug=%s via POST %s auth_user=%s token_source=%s url_source=%s timeout_seconds=%.1f curl=%s",
             instruction_id,
             kind,
             slug_norm,
@@ -2847,13 +2863,35 @@ class AgentRuntime:
             slug_norm,
             token_source,
             base_source,
+            timeout_seconds,
+            curl_preview,
         )
         try:
             res = requests.post(
                 url,
                 auth=(slug_norm, token),
                 headers=headers or None,
-                timeout=max(5, self.timeout),
+                timeout=timeout_seconds,
+            )
+        except requests.ReadTimeout as exc:
+            logger.error(
+                "Instruction id=%s kind=%s slug=%s watchdog request timed out url=%s timeout_seconds=%.1f error=%s",
+                instruction_id,
+                kind,
+                slug_norm,
+                url,
+                timeout_seconds,
+                exc,
+            )
+            return (
+                False,
+                {
+                    "watchdog_url": base_url,
+                    "url": url,
+                    "timeout_seconds": timeout_seconds,
+                    "curl": curl_preview,
+                },
+                f"watchdog request timed out after {int(round(timeout_seconds))}s: {exc}",
             )
         except requests.RequestException as exc:
             logger.error(
@@ -2864,7 +2902,16 @@ class AgentRuntime:
                 url,
                 exc,
             )
-            return False, {"watchdog_url": base_url, "url": url}, f"watchdog request failed: {exc}"
+            return (
+                False,
+                {
+                    "watchdog_url": base_url,
+                    "url": url,
+                    "timeout_seconds": timeout_seconds,
+                    "curl": curl_preview,
+                },
+                f"watchdog request failed: {exc}",
+            )
         try:
             data: Any = res.json()
         except Exception:
@@ -2882,7 +2929,14 @@ class AgentRuntime:
             return True, {"status_code": res.status_code, "response": data, "url": url}, None
         return (
             False,
-            {"status_code": res.status_code, "response": data, "watchdog_url": base_url, "url": url},
+            {
+                "status_code": res.status_code,
+                "response": data,
+                "watchdog_url": base_url,
+                "url": url,
+                "timeout_seconds": timeout_seconds,
+                "curl": curl_preview,
+            },
             "watchdog api call failed",
         )
 
