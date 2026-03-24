@@ -2108,6 +2108,12 @@ class AgentRuntime:
         if mode != "postgres":
             out["check"] = {"ok": False, "error": None, "detail": "sqlite mode"}
             return out
+        install_ok, install_error = self._ensure_postgres_installed()
+        if install_ok:
+            self._ensure_postgres_service()
+        else:
+            out["check"] = {"ok": False, "error": str(install_error or "psql is not installed"), "detail": None}
+            return out
         out["check"] = self._embedded_postgres_connectivity_check(
             pg_host=pg_host,
             pg_port=int(pg_port),
