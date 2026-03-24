@@ -130,6 +130,11 @@ sudo systemctl restart fabricator-agent
 Remote-only default behavior:
 
 - if `AGENT_LOCAL_API_URL` is empty, the agent tries `http://127.0.0.1:8000`
+- systemd package automatically imports provisioner env files when present:
+  - `/opt/ss14-provisioner/config/ss14-provisioner.env`
+  - `/opt/ss14-provisioner-dev/config/ss14-provisioner-dev.env`
+  - `/etc/ss14-provisioner/ss14-provisioner*.env`
+  so `SS14_API_TOKEN` / `SS14_EDGE_API_TOKEN` can be shared without manual duplication
 - `/status` exposes runtime state including `last_instruction_id`, pull/config sync timestamps, and current supported instruction kinds
 - `AGENT_LOG_LEVEL` controls instruction execution logs in `journalctl -u fabricator-agent` (`INFO` by default)
 - if `AGENT_LOCAL_API_URL` points to control-plane instead of local edge API, restart/update/stop instructions are rejected with explicit log error to prevent false `ok` acks
