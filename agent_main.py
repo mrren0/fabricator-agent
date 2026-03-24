@@ -218,6 +218,69 @@ def _detect_public_ip() -> str:
     return local_egress or external
 
 
+def _private_ip_sort_key(ip: str) -> tuple[int, int, str]:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except Exception:
+        return (9, 9, ip)
+    family_rank = 0 if addr.version == 4 else 1
+    private_rank = 0 if addr.is_private else 1
+    return (private_rank, family_rank, ip)
+
+
+def _detect_private_ip() -> str:
+    override = _env("AGENT_PRIVATE_IP")
+    if override:
+        values = []
+        for token in str(override).replace(",", " ").split():
+            ip = _normalize_ip(token)
+            if ip:
+                values.append(ip)
+        if values:
+            return sorted(set(values), key=_private_ip_sort_key)[0]
+
+    candidates: list[str] = []
+    try:
+        proc = subprocess.run(
+            ["/bin/sh", "-lc", "hostname -I"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            check=False,
+        )
+        for token in str(proc.stdout or "").replace(",", " ").split():
+            ip = _normalize_ip(token)
+            if ip:
+                candidates.append(ip)
+    except Exception:
+        pass
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("1.1.1.1", 80))
+            local_egress = _normalize_ip(sock.getsockname()[0])
+        finally:
+            sock.close()
+        if local_egress:
+            candidates.append(local_egress)
+    except Exception:
+        pass
+
+    filtered: list[str] = []
+    for ip in candidates:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except Exception:
+            continue
+        if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_unspecified:
+            continue
+        filtered.append(ip)
+    if not filtered:
+        return ""
+    return sorted(set(filtered), key=_private_ip_sort_key)[0]
+
+
 APP_VERSION = (_env("FABRICATOR_AGENT_VERSION", "0.1.0") or "0.1.0").strip() or "0.1.0"
 
 
@@ -413,6 +476,7 @@ class AgentRuntime:
         self.agent_id = self._resolve_agent_id()
         self.hostname = socket.gethostname()
         self.public_ip = _detect_public_ip()
+        self.private_ip = _detect_private_ip()
         self.location = _env("AGENT_LOCATION")
         self.config_path = Path(
             _env("AGENT_CONFIG_PATH", "/etc/fabricator-agent/config.toml") or "/etc/fabricator-agent/config.toml"
@@ -542,6 +606,8 @@ class AgentRuntime:
             "repair-instance",
             "get-instance-config",
             "set-instance-config",
+            "get-instance-database",
+            "set-instance-database",
         ]
 
     def _resolve_agent_id(self) -> str:
@@ -717,12 +783,18 @@ class AgentRuntime:
         payload = {
             "agent_id": self.agent_id,
             "hostname": self.hostname,
+            "public_ip": self.public_ip or None,
             "location": self.location,
             "config_path": str(self.config_path),
             "config_sha256": cfg_sha,
             "config": cfg,
             "capabilities": ["config.toml", "heartbeat", "instruction-pull"],
             "tags": [],
+            "details": {
+                "public_ip": self.public_ip or None,
+                "private_ip": self.private_ip or None,
+                "hostname": self.hostname,
+            },
         }
         res = requests.post(
             f"{self.backend_url}/api/agent/register",
@@ -758,6 +830,7 @@ class AgentRuntime:
                 "metrics": {},
                 "details": {
                     "public_ip": self.public_ip or None,
+                    "private_ip": self.private_ip or None,
                     "agent_version": APP_VERSION,
                     "agent_version_full": AGENT_VERSION_DISPLAY,
                     "agent_version_base": APP_VERSION,
@@ -798,6 +871,7 @@ class AgentRuntime:
             "metrics": {},
             "details": {
                 "public_ip": self.public_ip or None,
+                "private_ip": self.private_ip or None,
                 "agent_version": APP_VERSION,
                 "agent_version_full": AGENT_VERSION_DISPLAY,
                 "agent_version_base": APP_VERSION,
@@ -3327,6 +3401,8 @@ class AgentRuntime:
             "stop-instance",
             "update-instance",
             "repair-instance",
+            "get-instance-database",
+            "set-instance-database",
         }:
             local_api = self.local_api_url or _default_local_api_url()
             token = _local_api_token(self)
@@ -3337,6 +3413,8 @@ class AgentRuntime:
                 "stop-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/stop"),
                 "update-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/update"),
                 "repair-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/repair"),
+                "get-instance-database": ("GET", f"/api/ss14/instances/{payload.get('slug', '')}/database"),
+                "set-instance-database": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/database"),
             }
             method, path = endpoints[kind]
             if kind != "create-instance" and not str(payload.get("slug") or "").strip():
@@ -3346,6 +3424,11 @@ class AgentRuntime:
             kwargs: dict[str, Any] = {"headers": headers, "timeout": self.timeout}
             if kind == "create-instance":
                 kwargs["json"] = payload.get("body") or {}
+            elif kind == "set-instance-database":
+                mode = str(payload.get("mode") or "").strip().lower()
+                if mode not in {"postgres", "sqlite"}:
+                    return False, {"status_code": 400}, "payload.mode must be postgres or sqlite"
+                kwargs["json"] = {"mode": mode}
             elif kind == "stop-instance":
                 reason = str(payload.get("reason") or "").strip()
                 if reason:
@@ -3409,6 +3492,10 @@ class AgentRuntime:
                     msg,
                 )
             if ok:
+                if kind in {"get-instance-database", "set-instance-database"} and isinstance(data, dict):
+                    out = dict(data)
+                    out.setdefault("status_code", res.status_code)
+                    return True, out, None
                 if kind == "update-instance":
                     try:
                         self._embedded_reconcile_watchdog_services()
