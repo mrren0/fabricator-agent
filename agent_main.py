@@ -2114,13 +2114,38 @@ class AgentRuntime:
         else:
             out["check"] = {"ok": False, "error": str(install_error or "psql is not installed"), "detail": None}
             return out
-        out["check"] = self._embedded_postgres_connectivity_check(
+        check = self._embedded_postgres_connectivity_check(
             pg_host=pg_host,
             pg_port=int(pg_port),
             pg_database=dbname,
             pg_username=username,
             pg_password=password,
         )
+        error_text = str(check.get("error") or "").lower()
+        should_repair = (
+            not bool(check.get("ok"))
+            and ("password authentication failed" in error_text or "role" in error_text)
+            and _env_bool("AGENT_POSTGRES_AUTO_REPAIR_AUTH", True)
+        )
+        if should_repair:
+            repaired_ok, repaired_meta, repaired_error = self._embedded_postgres_provision(
+                dbname=dbname,
+                username=username,
+                password=password,
+            )
+            check["repair"] = dict(repaired_meta or {})
+            if repaired_ok:
+                check = self._embedded_postgres_connectivity_check(
+                    pg_host=pg_host,
+                    pg_port=int(pg_port),
+                    pg_database=dbname,
+                    pg_username=username,
+                    pg_password=password,
+                )
+                check["repair"] = {"ok": True, **dict(repaired_meta or {})}
+            else:
+                check["repair"] = {"ok": False, "error": str(repaired_error or "postgres auth repair failed"), **dict(repaired_meta or {})}
+        out["check"] = check
         return out
 
     def _embedded_set_instance_database_mode(self, slug: str, mode: str) -> tuple[bool, dict[str, Any], str | None]:
