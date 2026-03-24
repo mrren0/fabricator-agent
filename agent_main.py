@@ -1845,6 +1845,352 @@ class AgentRuntime:
         except Exception as exc:
             return False, {}, str(exc)
 
+    def _replace_toml_section(self, content: str, section: str, body_lines: list[str]) -> str:
+        section_name = str(section or "").strip()
+        if not section_name:
+            return str(content or "")
+        lines = str(content or "").splitlines()
+        sec_re = re.compile(r'^\s*\[([^\]]+)\]\s*$')
+        start = -1
+        end = len(lines)
+        for idx, line in enumerate(lines):
+            m = sec_re.match(line)
+            if not m:
+                continue
+            if str(m.group(1) or "").strip().lower() == section_name.lower():
+                start = idx
+                break
+        if start >= 0:
+            for idx in range(start + 1, len(lines)):
+                if sec_re.match(lines[idx]):
+                    end = idx
+                    break
+        block = [f"[{section_name}]"] + [str(line or "") for line in (body_lines or [])]
+        out = lines[:start] + block + lines[end:] if start >= 0 else lines + ([""] if lines else []) + block
+        return "\n".join(out).rstrip() + "\n"
+
+    def _database_values_from_config(self, content: str) -> dict[str, str]:
+        keys = ("engine", "pg_host", "pg_port", "pg_database", "pg_username", "pg_password")
+        values: dict[str, str] = {k: "" for k in keys}
+        lines = str(content or "").splitlines()
+        in_section = False
+        for line in lines:
+            sec = re.match(r'^\s*\[([^\]]+)\]\s*$', line)
+            if sec:
+                in_section = str(sec.group(1) or "").strip().lower() == "database"
+                continue
+            if not in_section:
+                continue
+            m = re.match(r'^\s*(#\s*)?([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$', line)
+            if not m:
+                continue
+            key = str(m.group(2) or "").strip().lower()
+            if key not in values:
+                continue
+            raw = str(m.group(3) or "").strip()
+            if raw.startswith('"') and raw.endswith('"'):
+                raw = raw[1:-1]
+            raw = raw.strip()
+            if not values[key]:
+                values[key] = raw
+            if not m.group(1):
+                values[key] = raw
+        return values
+
+    def _watchdog_token_from_config(self, content: str) -> str:
+        lines = str(content or "").splitlines()
+        in_section = False
+        fallback = ""
+        for line in lines:
+            sec = re.match(r'^\s*\[([^\]]+)\]\s*$', line)
+            if sec:
+                in_section = str(sec.group(1) or "").strip().lower() == "watchdog"
+                continue
+            if not in_section:
+                continue
+            m = re.match(r'^\s*(#\s*)?token\s*=\s*(".*?"|\S+)\s*$', line)
+            if not m:
+                continue
+            raw = str(m.group(2) or "").strip()
+            if raw.startswith('"') and raw.endswith('"'):
+                raw = raw[1:-1]
+            if m.group(1):
+                if not fallback:
+                    fallback = raw
+                continue
+            return raw
+        return fallback
+
+    @staticmethod
+    def _pg_ident(value: str) -> str:
+        return '"' + str(value or "").replace('"', '""') + '"'
+
+    @staticmethod
+    def _pg_literal(value: str) -> str:
+        return "'" + str(value or "").replace("'", "''") + "'"
+
+    def _postgres_superuser_cmd(self, psql_args: list[str]) -> list[str]:
+        args = list(psql_args or [])
+        if os.geteuid() == 0 and shutil.which("runuser"):
+            return ["runuser", "-u", "postgres", "--", "psql"] + args
+        if shutil.which("sudo"):
+            return ["sudo", "-n", "-u", "postgres", "psql"] + args
+        return ["psql", "-U", "postgres"] + args
+
+    def _ensure_postgres_installed(self) -> tuple[bool, str | None]:
+        if shutil.which("psql"):
+            return True, None
+        if not _env_bool("AGENT_POSTGRES_AUTO_INSTALL", True):
+            return False, "psql is missing and AGENT_POSTGRES_AUTO_INSTALL=0"
+        if os.geteuid() != 0:
+            return False, "psql is missing and auto-install requires root privileges"
+        if not shutil.which("apt-get"):
+            return False, "psql is missing and apt-get is unavailable for auto-install"
+        try:
+            subprocess.run(["apt-get", "update"], check=False, timeout=120)
+            proc = subprocess.run(
+                ["apt-get", "install", "-y", "postgresql", "postgresql-client"],
+                capture_output=True,
+                text=True,
+                timeout=240,
+                check=False,
+            )
+        except Exception as exc:
+            return False, f"postgres auto-install failed: {exc}"
+        if proc.returncode != 0:
+            tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[-1500:]
+            return False, f"postgres auto-install failed with code {proc.returncode}: {tail}"
+        return (True, None) if shutil.which("psql") else (False, "postgres auto-install finished but psql is still missing")
+
+    def _ensure_postgres_service(self) -> None:
+        if not shutil.which("systemctl"):
+            return
+        for unit in ("postgresql.service", "postgresql"):
+            try:
+                subprocess.run(["systemctl", "enable", "--now", unit], check=False, timeout=30)
+            except Exception:
+                continue
+
+    def _embedded_postgres_provision(self, *, dbname: str, username: str, password: str) -> tuple[bool, dict[str, Any], str | None]:
+        ok_install, install_error = self._ensure_postgres_installed()
+        if not ok_install:
+            return False, {"provisioned": False}, install_error
+        self._ensure_postgres_service()
+        role_lit = self._pg_literal(username)
+        role_ident = self._pg_ident(username)
+        db_lit = self._pg_literal(dbname)
+        db_ident = self._pg_ident(dbname)
+        pass_lit = self._pg_literal(password)
+
+        def run_sql(sql: str, *, timeout: int = 45) -> tuple[bool, str]:
+            cmd = self._postgres_superuser_cmd(["-v", "ON_ERROR_STOP=1", "-d", "postgres", "-tAc", sql])
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+            except Exception as exc:
+                return False, str(exc)
+            if proc.returncode != 0:
+                tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[-1200:]
+                return False, tail or f"psql exited with code {proc.returncode}"
+            return True, (proc.stdout or "").strip()
+
+        exists_role_ok, exists_role_out = run_sql(f"SELECT 1 FROM pg_roles WHERE rolname = {role_lit};")
+        if not exists_role_ok:
+            return False, {"provisioned": False}, f"failed to check postgres role: {exists_role_out}"
+        if exists_role_out.strip() == "1":
+            role_ok, role_out = run_sql(f"ALTER ROLE {role_ident} WITH LOGIN PASSWORD {pass_lit};")
+        else:
+            role_ok, role_out = run_sql(f"CREATE ROLE {role_ident} WITH LOGIN PASSWORD {pass_lit};")
+        if not role_ok:
+            return False, {"provisioned": False}, f"failed to configure postgres role: {role_out}"
+
+        exists_db_ok, exists_db_out = run_sql(f"SELECT 1 FROM pg_database WHERE datname = {db_lit};")
+        if not exists_db_ok:
+            return False, {"provisioned": False}, f"failed to check postgres database: {exists_db_out}"
+        if exists_db_out.strip() != "1":
+            db_ok, db_out = run_sql(f"CREATE DATABASE {db_ident} OWNER {role_ident};", timeout=90)
+            if not db_ok:
+                return False, {"provisioned": False}, f"failed to create postgres database: {db_out}"
+
+        grant_ok, grant_out = run_sql(f"GRANT ALL PRIVILEGES ON DATABASE {db_ident} TO {role_ident};")
+        if not grant_ok:
+            return False, {"provisioned": False}, f"failed to grant database privileges: {grant_out}"
+
+        return True, {"provisioned": True}, None
+
+    def _embedded_postgres_connectivity_check(
+        self,
+        *,
+        pg_host: str,
+        pg_port: int,
+        pg_database: str,
+        pg_username: str,
+        pg_password: str,
+    ) -> dict[str, Any]:
+        check: dict[str, Any] = {"ok": False, "error": None, "detail": None}
+        if not shutil.which("psql"):
+            check["error"] = "psql is not installed"
+            return check
+        env = dict(os.environ)
+        env["PGPASSWORD"] = str(pg_password or "")
+        cmd = [
+            "psql",
+            "-h",
+            str(pg_host),
+            "-p",
+            str(pg_port),
+            "-U",
+            str(pg_username),
+            "-d",
+            str(pg_database),
+            "-tAc",
+            "SELECT current_database(), current_user;",
+        ]
+        try:
+            proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30, check=False)
+        except Exception as exc:
+            check["error"] = str(exc)
+            return check
+        if proc.returncode != 0:
+            tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[-1200:]
+            check["error"] = tail or f"psql exited with code {proc.returncode}"
+            return check
+        row = str(proc.stdout or "").strip().splitlines()
+        first = row[0] if row else ""
+        parts = [part.strip() for part in first.split("|", 1)] if first else []
+        if len(parts) == 2:
+            check["detail"] = {"current_database": parts[0], "current_user": parts[1]}
+        else:
+            check["detail"] = {"raw": first}
+        check["ok"] = True
+        return check
+
+    def _embedded_database_state_from_content(self, slug: str, content: str) -> dict[str, Any]:
+        slug_norm = str(slug or "").strip().lower()
+        vals = self._database_values_from_config(content)
+        mode = "postgres" if str(vals.get("engine") or "").strip().lower() == "postgres" else "sqlite"
+        token = str(self._watchdog_token_from_config(content) or vals.get("pg_password") or "").strip()
+        if not token:
+            token = secrets.token_hex(16)
+        pg_host = str(
+            vals.get("pg_host")
+            or _env("SS14_INSTANCE_PG_HOST")
+            or _env("SS14_PG_CONFIG_HOST")
+            or _env("AGENT_PG_HOST")
+            or "127.0.0.1"
+        ).strip()
+        pg_port_raw = str(
+            vals.get("pg_port")
+            or _env("SS14_INSTANCE_PG_PORT")
+            or _env("SS14_PG_CONFIG_PORT")
+            or _env("SS14_PG_PORT")
+            or _env("AGENT_PG_PORT")
+            or "5432"
+        ).strip()
+        try:
+            pg_port = int(pg_port_raw)
+        except Exception:
+            pg_port = 5432
+        dbname = str(vals.get("pg_database") or slug_norm).strip() or slug_norm
+        username = str(vals.get("pg_username") or slug_norm).strip() or slug_norm
+        password = str(vals.get("pg_password") or token).strip() or token
+        out: dict[str, Any] = {
+            "slug": slug_norm,
+            "mode": mode,
+            "postgres": {
+                "pg_host": pg_host,
+                "pg_port": int(pg_port),
+                "pg_database": dbname,
+                "pg_username": username,
+                "pg_password": password,
+                "connect_uri": f"postgresql://{username}:{password}@{pg_host}:{int(pg_port)}/{dbname}",
+            },
+        }
+        if mode != "postgres":
+            out["check"] = {"ok": False, "error": None, "detail": "sqlite mode"}
+            return out
+        out["check"] = self._embedded_postgres_connectivity_check(
+            pg_host=pg_host,
+            pg_port=int(pg_port),
+            pg_database=dbname,
+            pg_username=username,
+            pg_password=password,
+        )
+        return out
+
+    def _embedded_set_instance_database_mode(self, slug: str, mode: str) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        target_mode = str(mode or "").strip().lower()
+        if target_mode not in {"postgres", "sqlite"}:
+            return False, {"status_code": 400}, "mode must be postgres or sqlite"
+        try:
+            cfg_path = self._embedded_instance_config_path(slug_norm)
+            content = cfg_path.read_text(encoding="utf-8", errors="ignore")
+        except ValueError as exc:
+            return False, {"status_code": 404}, str(exc)
+        except Exception as exc:
+            return False, {}, str(exc)
+
+        db_state = self._embedded_database_state_from_content(slug_norm, content)
+        pg = db_state.get("postgres") if isinstance(db_state.get("postgres"), dict) else {}
+        lines = [
+            'engine = "postgres"',
+            f'pg_host = "{str(pg.get("pg_host") or "127.0.0.1").strip()}"',
+            f'pg_port = {int(pg.get("pg_port") or 5432)}',
+            f'pg_database = "{str(pg.get("pg_database") or slug_norm).strip()}"',
+            f'pg_username = "{str(pg.get("pg_username") or slug_norm).strip()}"',
+            f'pg_password = "{str(pg.get("pg_password") or "").strip()}"',
+        ]
+        if target_mode == "sqlite":
+            lines = [f"# {line}" for line in lines]
+        next_content = self._replace_toml_section(content, "database", lines)
+        try:
+            backup = cfg_path.with_suffix(".toml.bak")
+            try:
+                backup.write_text(content, encoding="utf-8")
+            except Exception:
+                pass
+            cfg_path.write_text(next_content, encoding="utf-8")
+        except Exception as exc:
+            return False, {}, str(exc)
+
+        payload = self._embedded_database_state_from_content(slug_norm, next_content)
+        payload["updated"] = True
+        payload["config_path"] = str(cfg_path)
+        payload["content_sha256"] = hashlib.sha256(next_content.encode("utf-8")).hexdigest()
+        if target_mode == "postgres":
+            pg_now = payload.get("postgres") if isinstance(payload.get("postgres"), dict) else {}
+            ok, prov, prov_error = self._embedded_postgres_provision(
+                dbname=str(pg_now.get("pg_database") or slug_norm),
+                username=str(pg_now.get("pg_username") or slug_norm),
+                password=str(pg_now.get("pg_password") or ""),
+            )
+            payload["provision"] = dict(prov or {})
+            if not ok:
+                payload["provision"]["provisioned"] = False
+                return False, payload, str(prov_error or "postgres provisioning failed")
+            payload["check"] = self._embedded_postgres_connectivity_check(
+                pg_host=str(pg_now.get("pg_host") or "127.0.0.1"),
+                pg_port=int(pg_now.get("pg_port") or 5432),
+                pg_database=str(pg_now.get("pg_database") or slug_norm),
+                pg_username=str(pg_now.get("pg_username") or slug_norm),
+                pg_password=str(pg_now.get("pg_password") or ""),
+            )
+        return True, payload, None
+
+    def _embedded_get_instance_database(self, slug: str) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        try:
+            cfg_path = self._embedded_instance_config_path(slug_norm)
+            content = cfg_path.read_text(encoding="utf-8", errors="ignore")
+        except ValueError as exc:
+            return False, {"status_code": 404}, str(exc)
+        except Exception as exc:
+            return False, {}, str(exc)
+        payload = self._embedded_database_state_from_content(slug_norm, content)
+        payload["config_path"] = str(cfg_path)
+        payload["content_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return True, payload, None
+
     def _embedded_fix_ownership(self, path: Path, user: str, group: str, recursive: bool = True) -> None:
         try:
             uid = pwd.getpwnam(user).pw_uid
@@ -3334,6 +3680,13 @@ class AgentRuntime:
                 str(payload.get("slug") or ""),
                 str(payload.get("content") or ""),
             )
+        if kind == "get-instance-database":
+            return self._embedded_get_instance_database(str(payload.get("slug") or ""))
+        if kind == "set-instance-database":
+            return self._embedded_set_instance_database_mode(
+                str(payload.get("slug") or ""),
+                str(payload.get("mode") or ""),
+            )
         if kind in {"restart-instance", "update-instance", "stop-instance"}:
             instruction_id = str(item.get("id") or "").strip() or "-"
             slug = str(payload.get("slug") or "").strip()
@@ -3401,8 +3754,6 @@ class AgentRuntime:
             "stop-instance",
             "update-instance",
             "repair-instance",
-            "get-instance-database",
-            "set-instance-database",
         }:
             local_api = self.local_api_url or _default_local_api_url()
             token = _local_api_token(self)
@@ -3413,8 +3764,6 @@ class AgentRuntime:
                 "stop-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/stop"),
                 "update-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/update"),
                 "repair-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/repair"),
-                "get-instance-database": ("GET", f"/api/ss14/instances/{payload.get('slug', '')}/database"),
-                "set-instance-database": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/database"),
             }
             method, path = endpoints[kind]
             if kind != "create-instance" and not str(payload.get("slug") or "").strip():
@@ -3424,11 +3773,6 @@ class AgentRuntime:
             kwargs: dict[str, Any] = {"headers": headers, "timeout": self.timeout}
             if kind == "create-instance":
                 kwargs["json"] = payload.get("body") or {}
-            elif kind == "set-instance-database":
-                mode = str(payload.get("mode") or "").strip().lower()
-                if mode not in {"postgres", "sqlite"}:
-                    return False, {"status_code": 400}, "payload.mode must be postgres or sqlite"
-                kwargs["json"] = {"mode": mode}
             elif kind == "stop-instance":
                 reason = str(payload.get("reason") or "").strip()
                 if reason:
@@ -3492,10 +3836,6 @@ class AgentRuntime:
                     msg,
                 )
             if ok:
-                if kind in {"get-instance-database", "set-instance-database"} and isinstance(data, dict):
-                    out = dict(data)
-                    out.setdefault("status_code", res.status_code)
-                    return True, out, None
                 if kind == "update-instance":
                     try:
                         self._embedded_reconcile_watchdog_services()
