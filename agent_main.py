@@ -778,6 +778,28 @@ class AgentRuntime:
         self.status["last_config_snapshot_count"] = len(items)
         self.status["last_config_snapshot_error"] = None
 
+    def _heartbeat_remote_instances_payload(self) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for slug, cfg_path in self._list_embedded_instance_config_paths().items():
+            observed_at: float | None
+            try:
+                observed_at = float(cfg_path.stat().st_mtime)
+            except Exception:
+                observed_at = None
+            items.append(
+                {
+                    "slug": slug,
+                    "active": False,
+                    "status_code": 0,
+                    "body": "",
+                    "watchdog": {
+                        "config_path": str(cfg_path),
+                    },
+                    "observed_at": observed_at,
+                }
+            )
+        return items
+
     def _register(self, cfg: dict[str, Any] | None, cfg_sha: str | None) -> None:
         if not self.api_token or self._legacy_auth_disabled:
             return
@@ -838,6 +860,7 @@ class AgentRuntime:
                     "agent_build": AGENT_BUILD,
                     "agent_installed_at": AGENT_INSTALLED_AT,
                 },
+                "remote_instances": self._heartbeat_remote_instances_payload(),
             }
             res = requests.post(
                 f"{self.backend_url}/api/agent/runtime/{self.agent_id}/heartbeat",
