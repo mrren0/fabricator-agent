@@ -596,6 +596,7 @@ class AgentRuntime:
             "set-poll-seconds",
             "refresh-config",
             "run-diagnostic",
+            "get-watchdog-logs",
             "self-update-agent",
             "create-slug",
             "create-instance",
@@ -1452,6 +1453,80 @@ class AgentRuntime:
             self.status["last_diagnostic_at"] = time.time()
             self.status["last_diagnostic_ok"] = False
             return False, {"name": requested, "command": cmd}, f"diagnostic command binary is missing: {exc}"
+
+    def _get_watchdog_logs(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
+        slug = str((payload or {}).get("slug") or "").strip().lower()
+        if not slug:
+            return False, {}, "slug is required"
+        try:
+            lines = int((payload or {}).get("lines") or 120)
+        except Exception:
+            lines = 120
+        try:
+            since_seconds = int((payload or {}).get("since_seconds") or 120)
+        except Exception:
+            since_seconds = 120
+        lines = max(20, min(lines, 500))
+        since_seconds = max(5, min(since_seconds, 3600))
+        explicit_service = str((payload or {}).get("service") or "").strip()
+        candidates = []
+        if explicit_service:
+            candidates.append(explicit_service)
+        candidates.extend(
+            [
+                f"SS14.Watchdog-{slug}.service",
+                f"SS14.Watchdog-{slug}",
+                f"ss14-watchdog-{slug}.service",
+                f"ss14-watchdog-{slug}",
+            ]
+        )
+        seen: set[str] = set()
+        unique_candidates: list[str] = []
+        for value in candidates:
+            key = str(value or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique_candidates.append(key)
+        errors: list[str] = []
+        for service in unique_candidates:
+            cmd = [
+                "journalctl",
+                "-u",
+                service,
+                "-n",
+                str(lines),
+                "--no-pager",
+                "--since",
+                f"{since_seconds} seconds ago",
+            ]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(5, self.diagnostic_timeout))
+            except FileNotFoundError as exc:
+                return False, {"service": service}, f"journalctl is not available: {exc}"
+            except subprocess.TimeoutExpired as exc:
+                out = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+                err = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
+                errors.append(f"{service}: timed out; stdout={_log_tail(out)} stderr={_log_tail(err)}")
+                continue
+            stdout = str(proc.stdout or "")
+            stderr = str(proc.stderr or "")
+            if proc.returncode != 0:
+                errors.append(f"{service}: rc={proc.returncode} stderr={_log_tail(stderr)}")
+                continue
+            items = []
+            for raw in stdout.splitlines():
+                line = str(raw or "").rstrip()
+                if line:
+                    items.append({"raw": line})
+            return True, {
+                "slug": slug,
+                "service": service,
+                "lines": lines,
+                "since_seconds": since_seconds,
+                "items": items,
+            }, None
+        return False, {"slug": slug, "services": unique_candidates}, "watchdog log tail failed: " + " | ".join(errors[-4:])
 
     def _run_self_update(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
         payload_command = str(payload.get("command") or "").strip()
@@ -3698,6 +3773,8 @@ class AgentRuntime:
         if kind == "run-diagnostic":
             timeout_seconds = int(payload.get("timeout_seconds") or self.diagnostic_timeout)
             return self._run_diagnostic(str(payload.get("name") or ""), timeout_seconds=timeout_seconds)
+        if kind == "get-watchdog-logs":
+            return self._get_watchdog_logs(payload if isinstance(payload, dict) else {})
         if kind == "install-watchdog":
             return False, {}, "install-watchdog is disabled; use fixed instruction kinds only"
         if kind == "self-update-agent":
