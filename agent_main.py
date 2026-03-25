@@ -1521,7 +1521,7 @@ class AgentRuntime:
         except Exception:
             since_seconds = 120
         lines = max(20, min(lines, 500))
-        since_seconds = max(5, min(since_seconds, 3600))
+        since_seconds = max(5, min(since_seconds, 604800))
         explicit_service = str((payload or {}).get("service") or "").strip()
         journalctl_bin = self._journalctl_binary()
         if not journalctl_bin:
