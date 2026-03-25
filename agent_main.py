@@ -1454,6 +1454,60 @@ class AgentRuntime:
             self.status["last_diagnostic_ok"] = False
             return False, {"name": requested, "command": cmd}, f"diagnostic command binary is missing: {exc}"
 
+    @staticmethod
+    def _journalctl_binary() -> str | None:
+        discovered = shutil.which("journalctl")
+        if discovered:
+            return discovered
+        for candidate in ("/usr/bin/journalctl", "/bin/journalctl", "/usr/sbin/journalctl", "/sbin/journalctl"):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+
+    def _watchdog_service_candidates(self, slug: str, explicit_service: str | None = None) -> list[str]:
+        slug_norm = str(slug or "").strip().lower()
+        candidates: list[str] = []
+        if explicit_service:
+            candidates.append(str(explicit_service).strip())
+        candidates.extend(
+            [
+                f"SS14.Watchdog-{slug_norm}.service",
+                f"SS14.Watchdog-{slug_norm}",
+                f"ss14-watchdog-{slug_norm}.service",
+                f"ss14-watchdog-{slug_norm}",
+            ]
+        )
+        try:
+            proc = subprocess.run(
+                ["systemctl", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"],
+                capture_output=True,
+                text=True,
+                timeout=max(3, min(10, self.diagnostic_timeout)),
+            )
+            if proc.returncode == 0:
+                for raw in (proc.stdout or "").splitlines():
+                    text = str(raw or "").strip()
+                    if not text:
+                        continue
+                    unit = text.split(None, 1)[0]
+                    low = unit.lower()
+                    if "watchdog" not in low:
+                        continue
+                    if slug_norm and slug_norm not in low:
+                        continue
+                    candidates.append(unit)
+        except Exception:
+            pass
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in candidates:
+            key = str(value or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        return out
+
     def _get_watchdog_logs(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
         slug = str((payload or {}).get("slug") or "").strip().lower()
         if not slug:
@@ -1469,29 +1523,15 @@ class AgentRuntime:
         lines = max(20, min(lines, 500))
         since_seconds = max(5, min(since_seconds, 3600))
         explicit_service = str((payload or {}).get("service") or "").strip()
-        candidates = []
-        if explicit_service:
-            candidates.append(explicit_service)
-        candidates.extend(
-            [
-                f"SS14.Watchdog-{slug}.service",
-                f"SS14.Watchdog-{slug}",
-                f"ss14-watchdog-{slug}.service",
-                f"ss14-watchdog-{slug}",
-            ]
-        )
-        seen: set[str] = set()
-        unique_candidates: list[str] = []
-        for value in candidates:
-            key = str(value or "").strip()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            unique_candidates.append(key)
+        journalctl_bin = self._journalctl_binary()
+        if not journalctl_bin:
+            return False, {"slug": slug}, "journalctl is not available on this node"
+        unique_candidates = self._watchdog_service_candidates(slug, explicit_service=explicit_service)
         errors: list[str] = []
+        no_entries_services: list[str] = []
         for service in unique_candidates:
             cmd = [
-                "journalctl",
+                journalctl_bin,
                 "-u",
                 service,
                 "-n",
@@ -1514,11 +1554,18 @@ class AgentRuntime:
             if proc.returncode != 0:
                 errors.append(f"{service}: rc={proc.returncode} stderr={_log_tail(stderr)}")
                 continue
+            merged_text = (stdout + "\n" + stderr).lower()
+            if "-- no entries --" in merged_text:
+                no_entries_services.append(service)
+                continue
             items = []
             for raw in stdout.splitlines():
                 line = str(raw or "").rstrip()
                 if line:
                     items.append({"raw": line})
+            if not items:
+                no_entries_services.append(service)
+                continue
             return True, {
                 "slug": slug,
                 "service": service,
@@ -1526,7 +1573,20 @@ class AgentRuntime:
                 "since_seconds": since_seconds,
                 "items": items,
             }, None
-        return False, {"slug": slug, "services": unique_candidates}, "watchdog log tail failed: " + " | ".join(errors[-4:])
+        if no_entries_services:
+            return True, {
+                "slug": slug,
+                "service": no_entries_services[0],
+                "lines": lines,
+                "since_seconds": since_seconds,
+                "items": [],
+                "note": f"No entries found for services: {', '.join(no_entries_services[:4])}",
+            }, None
+        return False, {
+            "slug": slug,
+            "services": unique_candidates,
+            "journalctl_bin": journalctl_bin,
+        }, "watchdog log tail failed: " + " | ".join(errors[-4:])
 
     def _run_self_update(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
         payload_command = str(payload.get("command") or "").strip()
