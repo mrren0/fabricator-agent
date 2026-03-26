@@ -1487,11 +1487,23 @@ class AgentRuntime:
                 return candidate
         return None
 
-    def _watchdog_service_candidates(self, slug: str, explicit_service: str | None = None) -> list[str]:
+    def _watchdog_service_candidates(
+        self,
+        slug: str,
+        explicit_service: str | None = None,
+        explicit_services: list[str] | None = None,
+        watchdog_mode: str | None = None,
+    ) -> list[str]:
         slug_norm = str(slug or "").strip().lower()
         candidates: list[str] = []
         if explicit_service:
             candidates.append(str(explicit_service).strip())
+        for raw in list(explicit_services or []):
+            value = str(raw or "").strip()
+            if value:
+                candidates.append(value)
+        if str(watchdog_mode or "").strip().lower() == "shared":
+            candidates.append("SS14.Watchdog")
         candidates.extend(
             [
                 f"SS14.Watchdog-{slug_norm}.service",
@@ -1545,11 +1557,26 @@ class AgentRuntime:
             since_seconds = 120
         lines = max(20, min(lines, 500))
         since_seconds = max(5, min(since_seconds, 604800))
-        explicit_service = str((payload or {}).get("service") or "").strip()
+        explicit_service = str(
+            (payload or {}).get("service")
+            or (payload or {}).get("watchdog_service_name")
+            or (payload or {}).get("watchdog_service")
+            or ""
+        ).strip()
+        explicit_services_raw = (payload or {}).get("watchdog_services")
+        explicit_services: list[str] = []
+        if isinstance(explicit_services_raw, list):
+            explicit_services = [str(value or "").strip() for value in explicit_services_raw if str(value or "").strip()]
+        watchdog_mode = str((payload or {}).get("watchdog_service_mode") or "").strip().lower()
         journalctl_bin = self._journalctl_binary()
         if not journalctl_bin:
             return False, {"slug": slug}, "journalctl is not available on this node"
-        unique_candidates = self._watchdog_service_candidates(slug, explicit_service=explicit_service)
+        unique_candidates = self._watchdog_service_candidates(
+            slug,
+            explicit_service=explicit_service,
+            explicit_services=explicit_services,
+            watchdog_mode=watchdog_mode,
+        )
         errors: list[str] = []
         no_entries_services: list[str] = []
         for service in unique_candidates:
