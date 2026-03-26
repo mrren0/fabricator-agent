@@ -1502,8 +1502,16 @@ class AgentRuntime:
             value = str(raw or "").strip()
             if value:
                 candidates.append(value)
-        if str(watchdog_mode or "").strip().lower() == "shared":
-            candidates.append("SS14.Watchdog")
+        # Always include shared watchdog unit fallbacks. Some nodes run a single
+        # SS14.Watchdog service even for multiple slugs.
+        candidates.extend(
+            [
+                "SS14.Watchdog",
+                "SS14.Watchdog.service",
+                "ss14-watchdog.service",
+                "ss14-watchdog",
+            ]
+        )
         candidates.extend(
             [
                 f"SS14.Watchdog-{slug_norm}.service",
@@ -1527,8 +1535,6 @@ class AgentRuntime:
                     unit = text.split(None, 1)[0]
                     low = unit.lower()
                     if "watchdog" not in low:
-                        continue
-                    if slug_norm and slug_norm not in low:
                         continue
                     candidates.append(unit)
         except Exception:
