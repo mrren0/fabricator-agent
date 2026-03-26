@@ -1629,6 +1629,54 @@ class AgentRuntime:
                 "since_seconds": since_seconds,
                 "items": items,
             }, None
+        # Fallback: some hosts use unexpected unit names or journal aliases.
+        # Try a global journal tail and filter for watchdog-related lines.
+        try:
+            fallback_cmd = [
+                journalctl_bin,
+                "-n",
+                str(max(lines, 300)),
+                "--no-pager",
+                "--since",
+                f"{since_seconds} seconds ago",
+            ]
+            fallback_proc = subprocess.run(
+                fallback_cmd,
+                capture_output=True,
+                text=True,
+                timeout=max(5, self.diagnostic_timeout),
+            )
+            if fallback_proc.returncode == 0:
+                filtered: list[dict[str, str]] = []
+                slug_low = slug.lower()
+                for raw in str(fallback_proc.stdout or "").splitlines():
+                    line = str(raw or "").rstrip()
+                    if not line:
+                        continue
+                    low = line.lower()
+                    if "watchdog" not in low:
+                        continue
+                    if ("ss14.watchdog" not in low) and ("ss14-watchdog" not in low):
+                        continue
+                    # Prefer lines that mention slug, but keep generic watchdog lines too.
+                    score = 1
+                    if slug_low and slug_low in low:
+                        score = 0
+                    filtered.append({"raw": line, "_score": str(score)})
+                if filtered:
+                    filtered.sort(key=lambda row: int(str(row.get("_score") or "1")))
+                    items = [{"raw": row.get("raw") or ""} for row in filtered[:lines] if str(row.get("raw") or "").strip()]
+                    if items:
+                        return True, {
+                            "slug": slug,
+                            "service": "journalctl-global-watchdog-fallback",
+                            "lines": lines,
+                            "since_seconds": since_seconds,
+                            "items": items,
+                            "note": "resolved via global watchdog journal fallback",
+                        }, None
+        except Exception as exc:
+            errors.append(f"global-fallback: {exc}")
         if no_entries_services:
             return True, {
                 "slug": slug,
@@ -1636,7 +1684,7 @@ class AgentRuntime:
                 "lines": lines,
                 "since_seconds": since_seconds,
                 "items": [],
-                "note": f"No entries found for services: {', '.join(no_entries_services[:4])}",
+                "note": f"No entries found for services: {', '.join(no_entries_services[:8])}",
             }, None
         return False, {
             "slug": slug,
