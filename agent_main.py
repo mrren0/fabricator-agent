@@ -778,24 +778,223 @@ class AgentRuntime:
         self.status["last_config_snapshot_count"] = len(items)
         self.status["last_config_snapshot_error"] = None
 
+    @staticmethod
+    def _first_not_none(*values: Any) -> Any:
+        for value in values:
+            if value is not None:
+                return value
+        return None
+
+    @staticmethod
+    def _safe_int(value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except Exception:
+            return None
+        return parsed
+
+    @staticmethod
+    def _compact_status_body(*, status: str, name: str | None, players: int | None, max_players: int | None) -> str:
+        payload: dict[str, Any] = {"status": str(status or "unknown").strip().lower() or "unknown"}
+        if name:
+            payload["name"] = str(name)
+        if players is not None:
+            payload["players"] = int(players)
+        if max_players is not None:
+            payload["max_players"] = int(max_players)
+        return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+    def _read_embedded_instance_meta(self, slug: str, cfg_path: Path) -> dict[str, Any]:
+        meta: dict[str, Any] = {"slug": slug, "port": 0, "name": None, "max_players": None}
+        try:
+            parsed = tomllib.loads(cfg_path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            return meta
+        if not isinstance(parsed, dict):
+            return meta
+        status_cfg = parsed.get("status") if isinstance(parsed.get("status"), dict) else {}
+        server_cfg = parsed.get("server") if isinstance(parsed.get("server"), dict) else {}
+        net_cfg = parsed.get("net") if isinstance(parsed.get("net"), dict) else {}
+
+        name_raw = self._first_not_none(
+            server_cfg.get("name"),
+            status_cfg.get("name"),
+            status_cfg.get("server_name"),
+        )
+        name = str(name_raw or "").strip() or None
+        port = self._safe_int(self._first_not_none(net_cfg.get("port"), status_cfg.get("port"))) or 0
+        max_players = self._safe_int(
+            self._first_not_none(
+                status_cfg.get("max_players"),
+                status_cfg.get("maxplayers"),
+                server_cfg.get("max_players"),
+            )
+        )
+        meta["port"] = max(0, int(port))
+        meta["name"] = name
+        meta["max_players"] = max_players if (max_players is None or max_players >= 0) else None
+        return meta
+
+    def _probe_embedded_instance_status(
+        self,
+        *,
+        slug: str,
+        port: int,
+        configured_name: str | None,
+        configured_max_players: int | None,
+    ) -> dict[str, Any]:
+        base_url = f"http://127.0.0.1:{int(port)}"
+        if int(port or 0) <= 0:
+            compact_body = self._compact_status_body(
+                status="offline",
+                name=configured_name,
+                players=0,
+                max_players=configured_max_players,
+            )
+            return {
+                "active": False,
+                "status_code": 0,
+                "body": compact_body,
+                "url": "",
+                "error": "invalid instance port",
+                "status": "offline",
+                "name": configured_name,
+                "players": 0,
+                "max_players": configured_max_players,
+            }
+
+        timeout = max(0.4, min(float(self.timeout or 2.0), 2.0))
+        last_error = ""
+        for path in ("/status", "/info"):
+            url = f"{base_url}{path}"
+            try:
+                res = requests.get(url, timeout=timeout)
+                code = int(res.status_code or 0)
+                text = str(res.text or "")
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+
+            payload: dict[str, Any] = {}
+            if text.strip():
+                try:
+                    parsed = res.json() if hasattr(res, "json") else json.loads(text)
+                    if isinstance(parsed, dict):
+                        payload = parsed
+                except Exception:
+                    payload = {}
+            status_payload = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+            players = self._safe_int(
+                self._first_not_none(
+                    payload.get("players"),
+                    payload.get("player_count"),
+                    payload.get("current_players"),
+                    status_payload.get("players"),
+                )
+            )
+            max_players = self._safe_int(
+                self._first_not_none(
+                    payload.get("max_players"),
+                    payload.get("maxPlayers"),
+                    status_payload.get("max_players"),
+                    configured_max_players,
+                )
+            )
+            name = str(
+                self._first_not_none(
+                    payload.get("name"),
+                    payload.get("server_name"),
+                    status_payload.get("name"),
+                    configured_name,
+                    slug,
+                )
+                or ""
+            ).strip() or None
+
+            if code == 200:
+                compact_body = self._compact_status_body(
+                    status="online",
+                    name=name,
+                    players=(players if players is not None else 0),
+                    max_players=max_players,
+                )
+                return {
+                    "active": True,
+                    "status_code": 200,
+                    "body": compact_body,
+                    "url": url,
+                    "error": None,
+                    "status": "online",
+                    "name": name,
+                    "players": (players if players is not None else 0),
+                    "max_players": max_players,
+                }
+            if code == 404 and not text.strip():
+                continue
+            compact_body = self._compact_status_body(
+                status="offline",
+                name=name,
+                players=0,
+                max_players=max_players,
+            )
+            return {
+                "active": False,
+                "status_code": code,
+                "body": compact_body,
+                "url": url,
+                "error": f"status probe returned {code}",
+                "status": "offline",
+                "name": name,
+                "players": 0,
+                "max_players": max_players,
+            }
+
+        compact_body = self._compact_status_body(
+            status="offline",
+            name=(configured_name or slug),
+            players=0,
+            max_players=configured_max_players,
+        )
+        return {
+            "active": False,
+            "status_code": 0,
+            "body": compact_body,
+            "url": f"{base_url}/status",
+            "error": (last_error or "status probe failed"),
+            "status": "offline",
+            "name": (configured_name or slug),
+            "players": 0,
+            "max_players": configured_max_players,
+        }
+
     def _heartbeat_remote_instances_payload(self) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
+        now_ts = time.time()
         for slug, cfg_path in self._list_embedded_instance_config_paths().items():
-            observed_at: float | None
-            try:
-                observed_at = float(cfg_path.stat().st_mtime)
-            except Exception:
-                observed_at = None
+            meta = self._read_embedded_instance_meta(slug, cfg_path)
+            status_payload = self._probe_embedded_instance_status(
+                slug=slug,
+                port=int(meta.get("port") or 0),
+                configured_name=str(meta.get("name") or "").strip() or None,
+                configured_max_players=self._safe_int(meta.get("max_players")),
+            )
             items.append(
                 {
                     "slug": slug,
-                    "active": False,
-                    "status_code": 0,
-                    "body": "",
+                    "active": bool(status_payload.get("active")),
+                    "status_code": int(status_payload.get("status_code") or 0),
+                    "body": str(status_payload.get("body") or ""),
+                    "url": str(status_payload.get("url") or ""),
+                    "error": str(status_payload.get("error") or "").strip() or None,
+                    "status": str(status_payload.get("status") or "").strip().lower() or "offline",
+                    "name": str(status_payload.get("name") or "").strip() or slug,
+                    "players": int(status_payload.get("players") or 0),
+                    "max_players": self._safe_int(status_payload.get("max_players")),
                     "watchdog": {
                         "config_path": str(cfg_path),
+                        "port": int(meta.get("port") or 0),
                     },
-                    "observed_at": observed_at,
+                    "observed_at": now_ts,
                 }
             )
         return items
