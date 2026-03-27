@@ -884,19 +884,31 @@ class AgentRuntime:
                 except Exception:
                     payload = {}
             status_payload = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+            game_payload = payload.get("game") if isinstance(payload.get("game"), dict) else {}
+            status_game_payload = status_payload.get("game") if isinstance(status_payload.get("game"), dict) else {}
             players = self._safe_int(
                 self._first_not_none(
                     payload.get("players"),
                     payload.get("player_count"),
                     payload.get("current_players"),
+                    game_payload.get("players"),
+                    game_payload.get("player_count"),
+                    game_payload.get("current_players"),
                     status_payload.get("players"),
+                    status_game_payload.get("players"),
+                    status_game_payload.get("player_count"),
+                    status_game_payload.get("current_players"),
                 )
             )
             max_players = self._safe_int(
                 self._first_not_none(
                     payload.get("max_players"),
                     payload.get("maxPlayers"),
+                    game_payload.get("max_players"),
+                    game_payload.get("maxplayers"),
                     status_payload.get("max_players"),
+                    status_game_payload.get("max_players"),
+                    status_game_payload.get("maxplayers"),
                     configured_max_players,
                 )
             )
@@ -904,7 +916,16 @@ class AgentRuntime:
                 self._first_not_none(
                     payload.get("name"),
                     payload.get("server_name"),
+                    payload.get("hostname"),
+                    game_payload.get("hostname"),
+                    game_payload.get("name"),
+                    game_payload.get("server_name"),
                     status_payload.get("name"),
+                    status_payload.get("server_name"),
+                    status_payload.get("hostname"),
+                    status_game_payload.get("hostname"),
+                    status_game_payload.get("name"),
+                    status_game_payload.get("server_name"),
                     configured_name,
                     slug,
                 )
