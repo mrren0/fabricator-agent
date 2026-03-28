@@ -1139,7 +1139,7 @@ class AgentRuntime:
         logger.info("Legacy heartbeat accepted agent_id=%s", self.agent_id)
 
     def _pull(self) -> tuple[list[dict[str, Any]], float]:
-        request_timeout = max(self.timeout, self.instruction_wait_seconds + 5)
+        request_timeout = max(self.timeout, self.instruction_wait_seconds + 15)
         wait_seconds = max(0, int(self.instruction_wait_seconds))
         pull_started_at = time.time()
         pull_started_monotonic = time.monotonic()
@@ -1162,12 +1162,27 @@ class AgentRuntime:
                 self.instruction_limit,
                 wait_seconds,
             )
-            res = requests.get(
-                f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions",
-                params={"limit": int(self.instruction_limit), "wait_seconds": wait_seconds},
-                headers=self._runtime_headers(),
-                timeout=request_timeout,
-            )
+            try:
+                res = requests.get(
+                    f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions",
+                    params={"limit": int(self.instruction_limit), "wait_seconds": wait_seconds},
+                    headers=self._runtime_headers(),
+                    timeout=request_timeout,
+                )
+            except requests.ReadTimeout:
+                elapsed_ms = (time.monotonic() - pull_started_monotonic) * 1000.0
+                self.status["last_pull_http_status"] = None
+                self.status["last_pull_completed_at"] = time.time()
+                self.status["last_pull_duration_ms"] = round(elapsed_ms, 3)
+                self.status["last_pull_instruction_ids"] = []
+                logger.warning(
+                    "Instruction pull timed out mode=%s wait_seconds=%s timeout_seconds=%s elapsed_ms=%.1f",
+                    pull_mode,
+                    wait_seconds,
+                    request_timeout,
+                    elapsed_ms,
+                )
+                return [], float(self.poll_seconds)
             self.status["last_pull_http_status"] = int(res.status_code)
             if res.status_code == 401:
                 self._invalidate_runtime_token("Runtime token rejected while pulling; re-enrolling")
@@ -1226,12 +1241,27 @@ class AgentRuntime:
             self.instruction_limit,
             wait_seconds,
         )
-        res = requests.get(
-            f"{self.backend_url}/api/agent/instructions/{self.agent_id}",
-            params={"limit": int(self.instruction_limit), "wait_seconds": wait_seconds},
-            headers=self._headers(),
-            timeout=request_timeout,
-        )
+        try:
+            res = requests.get(
+                f"{self.backend_url}/api/agent/instructions/{self.agent_id}",
+                params={"limit": int(self.instruction_limit), "wait_seconds": wait_seconds},
+                headers=self._headers(),
+                timeout=request_timeout,
+            )
+        except requests.ReadTimeout:
+            elapsed_ms = (time.monotonic() - pull_started_monotonic) * 1000.0
+            self.status["last_pull_http_status"] = None
+            self.status["last_pull_completed_at"] = time.time()
+            self.status["last_pull_duration_ms"] = round(elapsed_ms, 3)
+            self.status["last_pull_instruction_ids"] = []
+            logger.warning(
+                "Instruction pull timed out mode=%s wait_seconds=%s timeout_seconds=%s elapsed_ms=%.1f",
+                pull_mode,
+                wait_seconds,
+                request_timeout,
+                elapsed_ms,
+            )
+            return [], float(self.poll_seconds)
         self.status["last_pull_http_status"] = int(res.status_code)
         if res.status_code == 401:
             self._legacy_auth_disabled = True
