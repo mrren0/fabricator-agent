@@ -42,7 +42,7 @@ def test_execute_instruction_get_instance_update_policy_uses_local_api():
     assert (result.get("response") or {}).get("update_mode") == "git"
     request_mock.assert_called_once_with(
         "GET",
-        "http://127.0.0.1:8000/api/ss14/instances/srv-1/update-policy",
+        "http://127.0.0.1:8000/api/ss14/admin/instances/srv-1/update-policy",
         headers={"X-API-Token": "token", "Content-Type": "application/json"},
         timeout=5,
     )
@@ -57,6 +57,8 @@ def test_execute_instruction_set_instance_update_policy_uses_local_api():
             "slug": "srv-1",
             "update_mode": "cdn",
             "manifest_url": "https://cdn.example/manifest.json",
+            "repo": "https://github.com/org/repo",
+            "branch": "master",
         },
     }
 
@@ -74,8 +76,13 @@ def test_execute_instruction_set_instance_update_policy_uses_local_api():
     assert (result.get("response") or {}).get("update_mode") == "cdn"
     request_mock.assert_called_once_with(
         "POST",
-        "http://127.0.0.1:8000/api/ss14/instances/srv-1/update-policy",
+        "http://127.0.0.1:8000/api/ss14/admin/instances/srv-1/update-policy",
         headers={"X-API-Token": "token", "Content-Type": "application/json"},
         timeout=5,
-        json={"update_mode": "cdn", "manifest_url": "https://cdn.example/manifest.json"},
+        json={
+            "update_mode": "cdn",
+            "manifest_url": "https://cdn.example/manifest.json",
+            "repo": "https://github.com/org/repo",
+            "branch": "master",
+        },
     )

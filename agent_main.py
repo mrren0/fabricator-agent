@@ -4290,8 +4290,8 @@ class AgentRuntime:
                 "stop-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/stop"),
                 "update-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/update"),
                 "repair-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/repair"),
-                "get-instance-update-policy": ("GET", f"/api/ss14/instances/{payload.get('slug', '')}/update-policy"),
-                "set-instance-update-policy": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/update-policy"),
+                "get-instance-update-policy": ("GET", f"/api/ss14/admin/instances/{payload.get('slug', '')}/update-policy"),
+                "set-instance-update-policy": ("POST", f"/api/ss14/admin/instances/{payload.get('slug', '')}/update-policy"),
             }
             method, path = endpoints[kind]
             if kind != "create-instance" and not str(payload.get("slug") or "").strip():
@@ -4305,6 +4305,8 @@ class AgentRuntime:
                 kwargs["json"] = {
                     "update_mode": str(payload.get("update_mode") or "").strip(),
                     "manifest_url": (str(payload.get("manifest_url") or "").strip() or None),
+                    "repo": (str(payload.get("repo") or "").strip() or None),
+                    "branch": (str(payload.get("branch") or "").strip() or None),
                 }
             elif kind == "stop-instance":
                 reason = str(payload.get("reason") or "").strip()
