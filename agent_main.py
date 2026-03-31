@@ -605,6 +605,8 @@ class AgentRuntime:
             "stop-instance",
             "update-instance",
             "repair-instance",
+            "get-instance-update-policy",
+            "set-instance-update-policy",
             "get-instance-config",
             "set-instance-config",
             "get-instance-database",
@@ -4276,6 +4278,8 @@ class AgentRuntime:
             "stop-instance",
             "update-instance",
             "repair-instance",
+            "get-instance-update-policy",
+            "set-instance-update-policy",
         }:
             local_api = self.local_api_url or _default_local_api_url()
             token = _local_api_token(self)
@@ -4286,6 +4290,8 @@ class AgentRuntime:
                 "stop-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/stop"),
                 "update-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/update"),
                 "repair-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/repair"),
+                "get-instance-update-policy": ("GET", f"/api/ss14/instances/{payload.get('slug', '')}/update-policy"),
+                "set-instance-update-policy": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/update-policy"),
             }
             method, path = endpoints[kind]
             if kind != "create-instance" and not str(payload.get("slug") or "").strip():
@@ -4295,6 +4301,11 @@ class AgentRuntime:
             kwargs: dict[str, Any] = {"headers": headers, "timeout": self.timeout}
             if kind == "create-instance":
                 kwargs["json"] = payload.get("body") or {}
+            elif kind == "set-instance-update-policy":
+                kwargs["json"] = {
+                    "update_mode": str(payload.get("update_mode") or "").strip(),
+                    "manifest_url": (str(payload.get("manifest_url") or "").strip() or None),
+                }
             elif kind == "stop-instance":
                 reason = str(payload.get("reason") or "").strip()
                 if reason:
