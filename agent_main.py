@@ -2265,6 +2265,19 @@ class AgentRuntime:
         wd_root = dedicated_base / f"{template_root.name}-{slug}"
         return template_root, dedicated_base, wd_root
 
+    def _embedded_fragment_path(self, slug: str) -> Path:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            raise ValueError("payload.slug is required")
+        template_root, _, wd_root = self._embedded_watchdog_layout(slug_norm)
+        dedicated_frag = wd_root / "instances.d" / f"{slug_norm}.yml"
+        legacy_frag = template_root / "instances.d" / f"{slug_norm}.yml"
+        if dedicated_frag.exists():
+            return dedicated_frag
+        if legacy_frag.exists():
+            return legacy_frag
+        raise ValueError(f"watchdog fragment for '{slug_norm}' does not exist")
+
     def _embedded_instance_config_path(self, slug: str) -> Path:
         slug_norm = str(slug or "").strip().lower()
         if not slug_norm:
@@ -2333,6 +2346,143 @@ class AgentRuntime:
                 },
                 None,
             )
+        except Exception as exc:
+            return False, {}, str(exc)
+
+    def _embedded_read_update_policy_from_fragment(self, content: str) -> dict[str, Any]:
+        txt = str(content or "")
+        api_token_match = re.search(r'^\s*ApiToken:\s*"([^"]+)"\s*$', txt, re.MULTILINE)
+        api_port_match = re.search(r'^\s*ApiPort:\s*(\d+)\s*$', txt, re.MULTILINE)
+        repo_match = re.search(r'^\s*BaseUrl:\s*"([^"]+)"\s*$', txt, re.MULTILINE)
+        branch_match = re.search(r'^\s*Branch:\s*"([^"]+)"\s*$', txt, re.MULTILINE)
+        update_type_match = re.search(r'^\s*UpdateType:\s*"([^"]+)"\s*$', txt, re.MULTILINE)
+        manifest_match = re.search(r'^\s*ManifestUrl:\s*"([^"]+)"\s*$', txt, re.MULTILINE)
+        update_type = str(update_type_match.group(1) or "").strip().lower() if update_type_match else "git"
+        update_mode = "cdn" if update_type == "manifest" else "git"
+        return {
+            "api_token": str(api_token_match.group(1) or "").strip() if api_token_match else "",
+            "api_port": int(api_port_match.group(1)) if api_port_match else 0,
+            "repo": str(repo_match.group(1) or "").strip() if repo_match else "",
+            "branch": (str(branch_match.group(1) or "").strip() if branch_match else "master") or "master",
+            "update_mode": update_mode,
+            "manifest_url": (str(manifest_match.group(1) or "").strip() if manifest_match else "") or None,
+        }
+
+    def _embedded_render_update_policy_fragment(
+        self,
+        *,
+        slug: str,
+        api_token: str,
+        api_port: int,
+        repo: str,
+        branch: str,
+        update_mode: str,
+        manifest_url: str | None,
+    ) -> str:
+        base = (
+            f"    {slug}:\n"
+            f"      Name: \"{slug}\"\n"
+            f"      ApiToken: \"{api_token}\"\n"
+            f"      ApiPort: {int(api_port)}\n"
+            f"      ConfigFileName: \"config.toml\"\n"
+        )
+        if str(update_mode or "").strip().lower() == "cdn":
+            manifest = str(manifest_url or "").strip()
+            if not manifest:
+                manifest = f"https://cdn.thun-der.ru/api/ss14/instances/{slug}/manifest"
+            update_block = (
+                f"      UpdateType: \"Manifest\"\n"
+                f"      Updates:\n"
+                f"        ManifestUrl: \"{manifest}\"\n"
+            )
+        else:
+            update_block = (
+                f"      UpdateType: \"Git\"\n"
+                f"      Updates:\n"
+                f"        BaseUrl: \"{repo}\"\n"
+                f"        Branch: \"{branch}\"\n"
+            )
+        return base + update_block + "      TimeoutSeconds: 120\n"
+
+    def _embedded_get_instance_update_policy(self, slug: str) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        try:
+            frag_path = self._embedded_fragment_path(slug_norm)
+            content = frag_path.read_text(encoding="utf-8", errors="ignore")
+            data = self._embedded_read_update_policy_from_fragment(content)
+            return True, {
+                "slug": slug_norm,
+                "repo": data.get("repo"),
+                "branch": data.get("branch"),
+                "update_mode": data.get("update_mode"),
+                "manifest_url": data.get("manifest_url"),
+                "fragment_path": str(frag_path),
+                "status": "ok",
+            }, None
+        except ValueError as exc:
+            return False, {"status_code": 404}, str(exc)
+        except Exception as exc:
+            return False, {}, str(exc)
+
+    def _embedded_set_instance_update_policy(
+        self,
+        slug: str,
+        update_mode: str,
+        manifest_url: str | None = None,
+        repo: str | None = None,
+        branch: str | None = None,
+    ) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        mode = str(update_mode or "").strip().lower() or "git"
+        if mode not in {"git", "cdn"}:
+            return False, {"status_code": 400}, "update_mode must be git or cdn"
+        try:
+            frag_path = self._embedded_fragment_path(slug_norm)
+        except ValueError as exc:
+            return False, {"status_code": 404}, str(exc)
+        try:
+            content = frag_path.read_text(encoding="utf-8", errors="ignore")
+            current = self._embedded_read_update_policy_from_fragment(content)
+            api_token = str(current.get("api_token") or "").strip()
+            api_port = int(current.get("api_port") or 0)
+            resolved_repo = str(repo or current.get("repo") or "").strip()
+            resolved_branch = str(branch or current.get("branch") or "master").strip() or "master"
+            if not api_token or api_port <= 0:
+                return False, {"status_code": 500}, f"invalid watchdog fragment for '{slug_norm}'"
+            if not resolved_repo:
+                return False, {"status_code": 400}, "repo is required"
+            next_content = self._embedded_render_update_policy_fragment(
+                slug=slug_norm,
+                api_token=api_token,
+                api_port=api_port,
+                repo=resolved_repo,
+                branch=resolved_branch,
+                update_mode=mode,
+                manifest_url=(str(manifest_url or "").strip() or None),
+            )
+            frag_path.write_text(next_content, encoding="utf-8")
+            template_root, _, wd_root = self._embedded_watchdog_layout(slug_norm)
+            fragments_dir = wd_root / "instances.d"
+            appsettings_base = wd_root / "appsettings.base.yml"
+            appsettings_out = wd_root / "appsettings.yml"
+            if not fragments_dir.exists():
+                fragments_dir = template_root / "instances.d"
+            if not appsettings_base.exists():
+                appsettings_base = template_root / "appsettings.base.yml"
+            if not appsettings_out.parent.exists():
+                appsettings_out = template_root / "appsettings.yml"
+            self._embedded_rebuild_appsettings(appsettings_base, appsettings_out, fragments_dir)
+            data = self._embedded_read_update_policy_from_fragment(next_content)
+            return True, {
+                "slug": slug_norm,
+                "repo": data.get("repo"),
+                "branch": data.get("branch"),
+                "update_mode": data.get("update_mode"),
+                "manifest_url": data.get("manifest_url"),
+                "fragment_path": str(frag_path),
+                "appsettings_path": str(appsettings_out),
+                "status": "update_policy_updated",
+            }, None
         except Exception as exc:
             return False, {}, str(exc)
 
@@ -4204,6 +4354,16 @@ class AgentRuntime:
                 str(payload.get("slug") or ""),
                 str(payload.get("content") or ""),
             )
+        if kind == "get-instance-update-policy":
+            return self._embedded_get_instance_update_policy(str(payload.get("slug") or ""))
+        if kind == "set-instance-update-policy":
+            return self._embedded_set_instance_update_policy(
+                str(payload.get("slug") or ""),
+                str(payload.get("update_mode") or ""),
+                str(payload.get("manifest_url") or "").strip() or None,
+                str(payload.get("repo") or "").strip() or None,
+                str(payload.get("branch") or "").strip() or None,
+            )
         if kind == "get-instance-database":
             return self._embedded_get_instance_database(str(payload.get("slug") or ""))
         if kind == "set-instance-database":
@@ -4278,8 +4438,6 @@ class AgentRuntime:
             "stop-instance",
             "update-instance",
             "repair-instance",
-            "get-instance-update-policy",
-            "set-instance-update-policy",
         }:
             local_api = self.local_api_url or _default_local_api_url()
             token = _local_api_token(self)
