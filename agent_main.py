@@ -22,6 +22,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -494,6 +495,12 @@ class AgentRuntime:
             5,
             int(_env("AGENT_CONFIG_SYNC_SECONDS", str(self.heartbeat_seconds)) or str(self.heartbeat_seconds)),
         )
+        self.watchdog_log_sync_seconds = max(
+            5,
+            int(_env("AGENT_WATCHDOG_LOG_SYNC_SECONDS", "15") or "15"),
+        )
+        self.watchdog_log_lines = max(20, min(400, int(_env("AGENT_WATCHDOG_LOG_SYNC_LINES", "80") or "80")))
+        self.watchdog_log_max_slugs = max(1, min(20, int(_env("AGENT_WATCHDOG_LOG_SYNC_MAX_SLUGS", "8") or "8")))
         self.runtime_post_retries = max(1, int(_env("AGENT_RUNTIME_POST_RETRIES", "3") or "3"))
         self.runtime_post_retry_delay = max(
             0.1,
@@ -552,6 +559,9 @@ class AgentRuntime:
             "last_config_snapshot_sync_at": None,
             "last_config_snapshot_count": 0,
             "last_config_snapshot_error": None,
+            "last_watchdog_log_sync_at": None,
+            "last_watchdog_log_sync_count": 0,
+            "last_watchdog_log_sync_error": None,
             "claim_code": None,
             "paired": False,
             "legacy_auth_disabled": False,
@@ -562,8 +572,10 @@ class AgentRuntime:
         }
         self._next_heartbeat_at = 0.0
         self._next_config_sync_at = 0.0
+        self._next_watchdog_log_sync_at = 0.0
         self._cycle_seq = 0
         self._config_snapshot_hashes: dict[str, str] = {}
+        self._watchdog_log_hashes: dict[str, deque[str]] = {}
         self._load_token_file()
         self._embedded_reconcile_watchdog_services()
         logger.info(
@@ -678,7 +690,9 @@ class AgentRuntime:
         self._clear_token_file()
         self.status["last_error"] = reason
         self._next_config_sync_at = 0.0
+        self._next_watchdog_log_sync_at = 0.0
         self._config_snapshot_hashes.clear()
+        self._watchdog_log_hashes.clear()
 
     def _read_config(self) -> tuple[dict[str, Any] | None, str | None]:
         if not self.config_path.exists():
@@ -690,6 +704,9 @@ class AgentRuntime:
 
     def _config_sync_due(self) -> bool:
         return time.time() >= float(self._next_config_sync_at or 0.0)
+
+    def _watchdog_log_sync_due(self) -> bool:
+        return time.time() >= float(self._next_watchdog_log_sync_at or 0.0)
 
     def _list_embedded_instance_config_paths(self) -> dict[str, Path]:
         template_root = Path(_env("SS14_WD_ROOT", "/opt/ss14/wds/watchdog") or "/opt/ss14/wds/watchdog")
@@ -779,6 +796,91 @@ class AgentRuntime:
         self.status["last_config_snapshot_sync_at"] = time.time()
         self.status["last_config_snapshot_count"] = len(items)
         self.status["last_config_snapshot_error"] = None
+
+    def _collect_watchdog_log_batch_for_slug(self, slug: str, cfg_path: Path) -> dict[str, Any] | None:
+        meta = self._read_embedded_instance_meta(slug, cfg_path)
+        payload_hints: dict[str, Any] = {
+            "slug": slug,
+            "lines": int(self.watchdog_log_lines),
+            "since_seconds": int(max(self.watchdog_log_sync_seconds * 3, 30)),
+        }
+        port = int(meta.get("port") or 0)
+        if port > 0:
+            payload_hints["watchdog_service_mode"] = "per-slug"
+        ok, result, error = self._get_watchdog_logs(payload_hints)
+        if not ok:
+            if str(error or "").strip():
+                self.status["last_watchdog_log_sync_error"] = str(error)
+            return None
+        items = result.get("items") if isinstance(result.get("items"), list) else []
+        if not items:
+            return None
+        cache = self._watchdog_log_hashes.setdefault(slug, deque(maxlen=800))
+        seen = set(cache)
+        fresh: list[dict[str, Any]] = []
+        now_ts = time.time()
+        for raw_item in items:
+            raw_line = str((raw_item or {}).get("raw") or "").rstrip()
+            if not raw_line:
+                continue
+            line_hash = hashlib.sha256(raw_line.encode("utf-8")).hexdigest()
+            if line_hash in seen:
+                continue
+            cache.append(line_hash)
+            seen.add(line_hash)
+            fresh.append(
+                {
+                    "raw": raw_line,
+                    "line_hash": line_hash,
+                    "line_ts": None,
+                    "collected_at": now_ts,
+                }
+            )
+        if not fresh:
+            return None
+        return {
+            "slug": slug,
+            "service_name": str(result.get("service") or "").strip() or None,
+            "items": fresh,
+        }
+
+    def _sync_watchdog_logs(self) -> None:
+        self._next_watchdog_log_sync_at = time.time() + float(self.watchdog_log_sync_seconds)
+        if not self.agent_token:
+            return
+        cfg_paths = self._list_embedded_instance_config_paths()
+        current_slugs = set(cfg_paths.keys())
+        for slug in list(self._watchdog_log_hashes):
+            if slug not in current_slugs:
+                self._watchdog_log_hashes.pop(slug, None)
+        batches: list[dict[str, Any]] = []
+        for slug in sorted(current_slugs)[: int(self.watchdog_log_max_slugs)]:
+            try:
+                batch = self._collect_watchdog_log_batch_for_slug(slug, cfg_paths[slug])
+            except Exception as exc:
+                self.status["last_watchdog_log_sync_error"] = str(exc)
+                logger.exception("Watchdog log sync collection failed slug=%s", slug)
+                continue
+            if batch:
+                batches.append(batch)
+        if not batches:
+            self.status["last_watchdog_log_sync_at"] = time.time()
+            self.status["last_watchdog_log_sync_count"] = 0
+            if self.status.get("last_watchdog_log_sync_error") is None:
+                self.status["last_watchdog_log_sync_error"] = None
+            return
+        res = self._post_with_retries(
+            f"{self.backend_url}/api/agent/runtime/{self.agent_id}/watchdog-logs",
+            json={"items": batches},
+            headers=self._runtime_headers(),
+        )
+        if res.status_code == 401:
+            self._invalidate_runtime_token("Runtime token rejected while syncing watchdog logs; re-enrolling")
+            return
+        res.raise_for_status()
+        self.status["last_watchdog_log_sync_at"] = time.time()
+        self.status["last_watchdog_log_sync_count"] = sum(len(item.get("items") or []) for item in batches)
+        self.status["last_watchdog_log_sync_error"] = None
 
     @staticmethod
     def _first_not_none(*values: Any) -> Any:
@@ -4589,6 +4691,12 @@ class AgentRuntime:
                     except Exception as exc:
                         self.status["last_config_snapshot_error"] = str(exc)
                         logger.exception("Config snapshot sync failed")
+                if self._watchdog_log_sync_due():
+                    try:
+                        self._sync_watchdog_logs()
+                    except Exception as exc:
+                        self.status["last_watchdog_log_sync_error"] = str(exc)
+                        logger.exception("Watchdog log sync failed")
                 items, next_poll_seconds = self._pull()
                 self.status["last_instruction_count"] = len(items)
                 sleep_seconds = float(next_poll_seconds if not items else 0.0)
@@ -4681,6 +4789,7 @@ class AgentRuntime:
                         cycle_error = error
                     if ok and instruction_kind in {"create-slug", "create-instance"}:
                         self._next_config_sync_at = 0.0
+                        self._next_watchdog_log_sync_at = 0.0
                     if instruction_id:
                         try:
                             self._ack(
