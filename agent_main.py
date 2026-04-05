@@ -3793,6 +3793,43 @@ class AgentRuntime:
             message += f" | {context}"
         raise RuntimeError(message)
 
+    def _validate_create_slug_command_result(self, body: dict[str, Any], result: dict[str, Any] | None = None) -> dict[str, Any]:
+        slug = str((body or {}).get("slug") or "").strip().lower()
+        if not slug:
+            raise RuntimeError("payload.body.slug is required")
+
+        template_root, _, wd_root = self._embedded_watchdog_layout(slug)
+        dedicated_cfg = wd_root / "instances" / slug / "config.toml"
+        legacy_cfg = template_root / "instances" / slug / "config.toml"
+        cfg_path = dedicated_cfg if dedicated_cfg.exists() else legacy_cfg
+        if not cfg_path.exists():
+            raise RuntimeError(f"create-slug command returned success but config.toml was not created for '{slug}'")
+
+        explicit_service = _env("SS14_WD_SYSTEMD_SERVICE", f"SS14.Watchdog-{slug}") or f"SS14.Watchdog-{slug}"
+        watchdog_url = ""
+        try:
+            watchdog_url, _ = self._resolve_watchdog_api_base_url(slug)
+        except Exception:
+            watchdog_url = ""
+        if not watchdog_url:
+            try:
+                watchdog_port = int((body or {}).get("watchdog_port") or 0)
+            except Exception:
+                watchdog_port = 0
+            if watchdog_port > 0:
+                watchdog_url = f"http://127.0.0.1:{watchdog_port}"
+        if not watchdog_url:
+            raise RuntimeError(
+                f"create-slug command returned success but watchdog API base URL could not be resolved for '{slug}'"
+            )
+        self._embedded_wait_watchdog_api(watchdog_url, explicit_service)
+        out = dict(result or {})
+        out["validated_slug"] = slug
+        out["config_path"] = str(cfg_path)
+        out["watchdog_url"] = watchdog_url
+        out["watchdog_service"] = explicit_service
+        return out
+
     def _embedded_create_slug(self, body: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
         slug = str(body.get("slug") or "").strip().lower()
         repo = str(body.get("repo") or "").strip()
@@ -4023,7 +4060,11 @@ class AgentRuntime:
                 "stderr_tail": (proc.stderr or "")[-self.output_tail_chars :],
             }
             if proc.returncode == 0:
-                return True, result, None
+                try:
+                    validated = self._validate_create_slug_command_result(body or {}, result)
+                except Exception as exc:
+                    return False, result, str(exc)
+                return True, validated, None
             return False, result, f"create-slug command failed with code {proc.returncode}"
 
         embedded_enabled = _env_bool("AGENT_EMBEDDED_CREATE_SLUG", True)
