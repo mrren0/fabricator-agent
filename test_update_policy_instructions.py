@@ -28,6 +28,7 @@ def test_supported_instruction_kinds_include_update_policy():
     kinds = agent_main.AgentRuntime.supported_instruction_kinds()
     assert "get-instance-update-policy" in kinds
     assert "set-instance-update-policy" in kinds
+    assert "reset-instance-sqlite" in kinds
 
 
 def test_execute_instruction_get_instance_update_policy_uses_embedded_fragment():
@@ -240,3 +241,35 @@ def test_restart_instance_prepares_runtime_from_extracted_runtimeconfig():
     assert result["runtime"]["framework"] == "Microsoft.NETCore.App"
     assert result["runtime"]["version"] == "9.0.0"
     install_mock.assert_called_once_with("Microsoft.NETCore.App", "9.0.0")
+
+
+def test_reset_instance_sqlite_removes_data_directory():
+    runtime = _runtime()
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        slug = "srv-1"
+        wd_root = root / "watchdog-srv-1"
+        inst_dir = wd_root / "instances" / slug
+        (inst_dir / "data").mkdir(parents=True, exist_ok=True)
+        (inst_dir / "data" / "server.db").write_text("sqlite", encoding="utf-8")
+        (inst_dir / "config.toml").write_text('[database]\nengine = "sqlite"\n', encoding="utf-8")
+        old = {k: agent_main.os.environ.get(k) for k in ("SS14_WD_ROOT", "SS14_WD_DEDICATED_BASE")}
+        agent_main.os.environ["SS14_WD_ROOT"] = str(root / "watchdog")
+        agent_main.os.environ["SS14_WD_DEDICATED_BASE"] = str(root)
+        try:
+            ok, result, error = runtime._embedded_reset_instance_sqlite(
+                slug,
+                delete_database=False,
+                delete_data=True,
+            )
+        finally:
+            for key, value in old.items():
+                if value is None:
+                    agent_main.os.environ.pop(key, None)
+                else:
+                    agent_main.os.environ[key] = value
+
+    assert ok is True
+    assert error is None
+    assert result["updated"] is True
+    assert any(path.endswith("data") for path in result["deleted_paths"])

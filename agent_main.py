@@ -623,6 +623,7 @@ class AgentRuntime:
             "set-instance-config",
             "get-instance-database",
             "set-instance-database",
+            "reset-instance-sqlite",
         ]
 
     def _resolve_agent_id(self) -> str:
@@ -3071,6 +3072,80 @@ class AgentRuntime:
         payload["content_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
         return True, payload, None
 
+    def _embedded_reset_instance_sqlite(
+        self,
+        slug: str,
+        *,
+        delete_database: bool,
+        delete_data: bool,
+    ) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            return False, {"status_code": 400}, "slug is required"
+        if not delete_database and not delete_data:
+            return False, {"status_code": 400}, "nothing selected to delete"
+        try:
+            cfg_path = self._embedded_instance_config_path(slug_norm)
+            content = cfg_path.read_text(encoding="utf-8", errors="ignore")
+        except ValueError as exc:
+            return False, {"status_code": 404}, str(exc)
+        except Exception as exc:
+            return False, {}, str(exc)
+        payload = self._embedded_database_state_from_content(slug_norm, content)
+        if str(payload.get("mode") or "").strip().lower() != "sqlite":
+            return False, {"status_code": 400}, "sqlite reset is available only when database mode is sqlite"
+        instance_dir = cfg_path.parent
+        deleted_paths: list[str] = []
+        sqlite_patterns = (
+            "*.db",
+            "*.db-shm",
+            "*.db-wal",
+            "*.sqlite",
+            "*.sqlite-shm",
+            "*.sqlite-wal",
+            "*.sqlite3",
+            "*.sqlite3-shm",
+            "*.sqlite3-wal",
+        )
+        seen: set[Path] = set()
+
+        def _remove_path(path: Path) -> None:
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=False)
+                else:
+                    path.unlink(missing_ok=True)
+                deleted_paths.append(str(path))
+            except FileNotFoundError:
+                return
+
+        if delete_database:
+            search_roots = [instance_dir]
+            data_dir = instance_dir / "data"
+            if data_dir.exists():
+                search_roots.append(data_dir)
+            for root in search_roots:
+                for pattern in sqlite_patterns:
+                    for candidate in root.glob(pattern):
+                        if candidate in seen:
+                            continue
+                        seen.add(candidate)
+                        _remove_path(candidate)
+
+        if delete_data:
+            data_dir = instance_dir / "data"
+            if data_dir.exists():
+                _remove_path(data_dir)
+
+        result = self._embedded_database_state_from_content(slug_norm, content)
+        result["deleted_paths"] = deleted_paths
+        result["delete_database"] = bool(delete_database)
+        result["delete_data"] = bool(delete_data)
+        result["updated"] = bool(deleted_paths)
+        result["config_path"] = str(cfg_path)
+        result["content_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return True, result, None
+
     def _embedded_fix_ownership(self, path: Path, user: str, group: str, recursive: bool = True) -> None:
         try:
             uid = pwd.getpwnam(user).pw_uid
@@ -4728,6 +4803,12 @@ class AgentRuntime:
             return self._embedded_set_instance_database_mode(
                 str(payload.get("slug") or ""),
                 str(payload.get("mode") or ""),
+            )
+        if kind == "reset-instance-sqlite":
+            return self._embedded_reset_instance_sqlite(
+                str(payload.get("slug") or ""),
+                delete_database=bool(payload.get("delete_database")),
+                delete_data=bool(payload.get("delete_data")),
             )
         if kind in {"restart-instance", "update-instance", "stop-instance"}:
             instruction_id = str(item.get("id") or "").strip() or "-"
