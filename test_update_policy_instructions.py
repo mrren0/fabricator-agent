@@ -273,3 +273,13 @@ def test_reset_instance_sqlite_removes_data_directory():
     assert error is None
     assert result["updated"] is True
     assert any(path.endswith("data") for path in result["deleted_paths"])
+
+
+def test_database_values_ignore_commented_postgres_lines():
+    runtime = _runtime()
+
+    values = runtime._database_values_from_config(
+        '[database]\n# engine = "postgres"\n# pg_host = "127.0.0.1"\n'
+    )
+
+    assert values["engine"] == ""

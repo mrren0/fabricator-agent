@@ -2737,14 +2737,13 @@ class AgentRuntime:
             key = str(m.group(2) or "").strip().lower()
             if key not in values:
                 continue
+            if m.group(1):
+                continue
             raw = str(m.group(3) or "").strip()
             if raw.startswith('"') and raw.endswith('"'):
                 raw = raw[1:-1]
             raw = raw.strip()
-            if not values[key]:
-                values[key] = raw
-            if not m.group(1):
-                values[key] = raw
+            values[key] = raw
         return values
 
     def _watchdog_token_from_config(self, content: str) -> str:
