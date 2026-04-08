@@ -2575,7 +2575,10 @@ class AgentRuntime:
                 appsettings_out = template_root / "appsettings.yml"
             self._embedded_rebuild_appsettings(appsettings_base, appsettings_out, fragments_dir)
             data = self._embedded_read_update_policy_from_fragment(next_content)
-            return True, {
+            runtime_info = None
+            if str(data.get("update_mode") or "").strip().lower() == "cdn":
+                runtime_info = self._embedded_ensure_runtime_for_manifest_url(str(data.get("manifest_url") or "").strip() or None)
+            payload = {
                 "slug": slug_norm,
                 "repo": data.get("repo"),
                 "branch": data.get("branch"),
@@ -2584,9 +2587,112 @@ class AgentRuntime:
                 "fragment_path": str(frag_path),
                 "appsettings_path": str(appsettings_out),
                 "status": "update_policy_updated",
-            }, None
+            }
+            if runtime_info:
+                payload["runtime"] = runtime_info
+            return True, payload, None
         except Exception as exc:
             return False, {}, str(exc)
+
+    def _embedded_manifest_build_platform(self) -> str:
+        return (
+            str(_env("SS14_ROBUST_CDN_BUILD_PLATFORM") or _env("SS14_MANIFEST_BUILD_PLATFORM") or "linux-x64").strip()
+            or "linux-x64"
+        )
+
+    def _runtime_requirement_from_runtimeconfig_payload(self, payload: Any) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        runtime_options = payload.get("runtimeOptions")
+        if not isinstance(runtime_options, dict):
+            return None
+        frameworks: list[dict[str, Any]] = []
+        framework = runtime_options.get("framework")
+        if isinstance(framework, dict):
+            frameworks.append(framework)
+        multi = runtime_options.get("frameworks")
+        if isinstance(multi, list):
+            frameworks.extend(item for item in multi if isinstance(item, dict))
+        preferred = None
+        fallback = None
+        for item in frameworks:
+            name = str(item.get("name") or "").strip()
+            version = str(item.get("version") or "").strip()
+            if not name or not version:
+                continue
+            candidate = {"framework": name, "version": version}
+            if fallback is None:
+                fallback = candidate
+            if name == "Microsoft.NETCore.App":
+                preferred = candidate
+                break
+        return preferred or fallback
+
+    def _runtime_requirement_from_manifest_payload(self, payload: Any) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        builds = payload.get("builds")
+        if not isinstance(builds, dict):
+            return None
+        platform = self._embedded_manifest_build_platform()
+        ordered = sorted(
+            builds.items(),
+            key=lambda item: str(((item[1] or {}).get("time") if isinstance(item[1], dict) else "") or item[0]),
+            reverse=True,
+        )
+        for _, build in ordered:
+            if not isinstance(build, dict):
+                continue
+            server = build.get("server")
+            if not isinstance(server, dict):
+                continue
+            platform_info = server.get(platform) if isinstance(server.get(platform), dict) else None
+            if platform_info is None:
+                for value in server.values():
+                    if isinstance(value, dict):
+                        platform_info = value
+                        break
+            if not isinstance(platform_info, dict):
+                continue
+            runtime = platform_info.get("runtime")
+            if isinstance(runtime, dict):
+                framework = str(runtime.get("framework") or "").strip()
+                version = str(runtime.get("version") or "").strip()
+                if framework and version:
+                    return {"framework": framework, "version": version}
+        return None
+
+    def _embedded_fetch_manifest_runtime_requirement(self, manifest_url: str | None) -> dict[str, Any] | None:
+        url = str(manifest_url or "").strip()
+        if not url:
+            return None
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+        return self._runtime_requirement_from_manifest_payload(payload)
+
+    def _embedded_instance_runtime_requirement(self, slug: str) -> dict[str, Any] | None:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            return None
+        _, _, wd_root = self._embedded_watchdog_layout(slug_norm)
+        bin_dir = wd_root / "instances" / slug_norm / "bin"
+        candidates = [
+            bin_dir / "Robust.Server.runtimeconfig.json",
+            bin_dir / "Content.Server.runtimeconfig.json",
+        ]
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            requirement = self._runtime_requirement_from_runtimeconfig_payload(payload)
+            if requirement:
+                requirement["runtimeconfig_path"] = str(path)
+                return requirement
+        return None
 
     def _replace_toml_section(self, content: str, section: str, body_lines: list[str]) -> str:
         section_name = str(section or "").strip()
@@ -3420,6 +3526,34 @@ class AgentRuntime:
                 versions.add(version)
         return versions
 
+    def _embedded_list_installed_runtimes(self, dotnet_cmd: list[str]) -> dict[str, set[str]]:
+        try:
+            proc = subprocess.run(
+                [*dotnet_cmd, "--list-runtimes"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except Exception:
+            return {}
+        if proc.returncode != 0:
+            return {}
+        runtimes: dict[str, set[str]] = {}
+        for raw_line in (proc.stdout or "").splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            match = re.match(r"^(?P<name>\S+)\s+(?P<version>\S+)\s+\[", line)
+            if not match:
+                continue
+            name = str(match.group("name") or "").strip()
+            version = str(match.group("version") or "").strip()
+            if not name or not version:
+                continue
+            runtimes.setdefault(name, set()).add(version)
+        return runtimes
+
     def _embedded_required_sdk_versions(self, source_dir: Path) -> list[str]:
         global_json = source_dir / "global.json"
         if not global_json.exists():
@@ -3454,12 +3588,30 @@ class AgentRuntime:
         if recursive:
             subprocess.run([git_cmd, "submodule", "update", "--init", "--recursive"], cwd=source_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=600, check=True)
 
-    def _embedded_ensure_dotnet_sdk(self, required_versions: list[str] | None = None) -> list[str]:
+    def _embedded_prepare_dotnet_install(self) -> tuple[Path, list[str], Path, dict[str, str], str, Path]:
         preferred = Path(_env("SS14_DOTNET", "/opt/dotnet/dotnet") or "/opt/dotnet/dotnet")
         try:
             existing = self._embedded_dotnet_command()
         except RuntimeError:
             existing = [str(preferred)]
+        install_script = Path("/tmp/dotnet-install.sh")
+        installer_url = _env("SS14_DOTNET_INSTALL_URL", "https://dot.net/v1/dotnet-install.sh") or "https://dot.net/v1/dotnet-install.sh"
+        try:
+            res = requests.get(installer_url, timeout=60)
+            res.raise_for_status()
+            install_script.write_text(res.text, encoding="utf-8")
+            install_script.chmod(0o755)
+        except Exception as exc:
+            raise RuntimeError(f"failed to download dotnet-install.sh: {exc}")
+        install_dir = preferred.parent
+        install_dir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env.setdefault("DOTNET_CLI_HOME", "/tmp")
+        bash = shutil.which("bash") or "/bin/bash"
+        return preferred, existing, install_dir, env, bash, install_script
+
+    def _embedded_ensure_dotnet_sdk(self, required_versions: list[str] | None = None) -> list[str]:
+        preferred, existing, install_dir, env, bash, install_script = self._embedded_prepare_dotnet_install()
         installed = self._embedded_list_installed_sdks(existing)
         wanted_versions: list[str] = []
         for raw in required_versions or []:
@@ -3470,22 +3622,6 @@ class AgentRuntime:
         missing_versions = [version for version in wanted_versions if version not in installed]
         if has_dotnet_10 and not missing_versions:
             return existing
-
-        install_script = Path("/tmp/dotnet-install.sh")
-        installer_url = _env("SS14_DOTNET_INSTALL_URL", "https://dot.net/v1/dotnet-install.sh") or "https://dot.net/v1/dotnet-install.sh"
-        try:
-            res = requests.get(installer_url, timeout=60)
-            res.raise_for_status()
-            install_script.write_text(res.text, encoding="utf-8")
-            install_script.chmod(0o755)
-        except Exception as exc:
-            raise RuntimeError(f"failed to download dotnet-install.sh: {exc}")
-
-        install_dir = preferred.parent
-        install_dir.mkdir(parents=True, exist_ok=True)
-        env = os.environ.copy()
-        env.setdefault("DOTNET_CLI_HOME", "/tmp")
-        bash = shutil.which("bash") or "/bin/bash"
         if not has_dotnet_10:
             try:
                 subprocess.run(
@@ -3517,6 +3653,75 @@ class AgentRuntime:
         if not preferred.exists():
             raise RuntimeError(f"dotnet 10 installation completed but {preferred} was not found")
         return [str(preferred)]
+
+    def _embedded_ensure_dotnet_runtime(self, framework_name: str | None, version: str | None) -> list[str]:
+        framework = str(framework_name or "").strip()
+        version_text = str(version or "").strip()
+        if not framework or not version_text:
+            raise RuntimeError("framework and version are required to install dotnet runtime")
+        runtime_kind = {
+            "Microsoft.NETCore.App": "dotnet",
+            "Microsoft.AspNetCore.App": "aspnetcore",
+        }.get(framework)
+        if not runtime_kind:
+            raise RuntimeError(f"unsupported .NET runtime framework: {framework}")
+        preferred, existing, install_dir, env, bash, install_script = self._embedded_prepare_dotnet_install()
+        installed = self._embedded_list_installed_runtimes(existing)
+        if version_text in installed.get(framework, set()):
+            return existing
+        try:
+            subprocess.run(
+                [bash, str(install_script), "--runtime", runtime_kind, "--version", version_text, "--install-dir", str(install_dir)],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1800,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr_tail = str(exc.stderr or "").strip()[-1200:]
+            raise RuntimeError(
+                f"dotnet-install.sh failed for runtime {framework} {version_text} with code {exc.returncode}: {stderr_tail or 'no stderr'}"
+            )
+        if not preferred.exists():
+            raise RuntimeError(f".NET runtime installation completed but {preferred} was not found")
+        return [str(preferred)]
+
+    def _embedded_ensure_runtime_requirement(self, requirement: dict[str, Any] | None, *, source: str) -> dict[str, Any] | None:
+        if not isinstance(requirement, dict):
+            return None
+        framework = str(requirement.get("framework") or "").strip()
+        version = str(requirement.get("version") or "").strip()
+        if not framework or not version:
+            return None
+        preferred = Path(_env("SS14_DOTNET", "/opt/dotnet/dotnet") or "/opt/dotnet/dotnet")
+        try:
+            dotnet_cmd = self._embedded_dotnet_command()
+        except RuntimeError:
+            dotnet_cmd = [str(preferred)]
+        installed_before = self._embedded_list_installed_runtimes(dotnet_cmd)
+        already_present = version in installed_before.get(framework, set())
+        if not already_present:
+            self._embedded_ensure_dotnet_runtime(framework, version)
+        return {
+            "source": source,
+            "framework": framework,
+            "version": version,
+            "installed": not already_present,
+            "already_present": already_present,
+        }
+
+    def _embedded_ensure_runtime_for_manifest_url(self, manifest_url: str | None) -> dict[str, Any] | None:
+        url = str(manifest_url or "").strip()
+        if not url:
+            return None
+        requirement = self._embedded_fetch_manifest_runtime_requirement(url)
+        return self._embedded_ensure_runtime_requirement(requirement, source=f"manifest:{url}")
+
+    def _embedded_ensure_runtime_for_instance(self, slug: str) -> dict[str, Any] | None:
+        requirement = self._embedded_instance_runtime_requirement(slug)
+        return self._embedded_ensure_runtime_requirement(requirement, source=f"instance:{str(slug or '').strip().lower()}")
 
     def _embedded_ensure_watchdog_source(self, source_dir: Path, repo_url: str, branch: str) -> None:
         self._embedded_sync_git_repo(source_dir, repo_url, branch, recursive=True)
@@ -4303,7 +4508,12 @@ class AgentRuntime:
             _log_tail(data),
         )
         if ok:
-            return True, {"status_code": res.status_code, "response": data, "url": url}, None
+            result = {"status_code": res.status_code, "response": data, "url": url}
+            if action == "update":
+                runtime_info = self._embedded_ensure_runtime_for_instance(slug_norm)
+                if runtime_info:
+                    result["runtime"] = runtime_info
+            return True, result, None
         return (
             False,
             {
@@ -4327,6 +4537,10 @@ class AgentRuntime:
         slug_norm = str(slug or "").strip().lower()
         if not slug_norm:
             return False, {}, "payload.slug is required"
+        try:
+            runtime_info = self._embedded_ensure_runtime_for_instance(slug_norm)
+        except Exception as exc:
+            return False, {"slug": slug_norm}, f"failed to prepare .NET runtime for instance '{slug_norm}': {exc}"
         base = f"SS14.Watchdog-{slug_norm}"
         candidates: list[str] = [
             base,
@@ -4382,6 +4596,7 @@ class AgentRuntime:
                     "service": unit,
                     "service_active": active,
                     "command": f"systemctl restart {unit}",
+                    "runtime": runtime_info,
                 },
                 None,
             )
@@ -4530,6 +4745,21 @@ class AgentRuntime:
                     slug=slug,
                     action="update",
                 )
+                runtime_info = (result or {}).get("runtime") if isinstance(result, dict) else None
+                if ok and isinstance(runtime_info, dict) and bool(runtime_info.get("installed")):
+                    restart_ok, restart_result, restart_error = self._execute_watchdog_service_restart(
+                        instruction_id=instruction_id,
+                        kind="restart-instance",
+                        slug=slug,
+                    )
+                    if not restart_ok:
+                        merged = dict(result or {})
+                        merged["runtime_restart_error"] = restart_error
+                        merged["runtime_restart_result"] = restart_result
+                        return False, merged, f"watchdog update succeeded and .NET runtime was installed, but restart failed: {restart_error}"
+                    merged = dict(result or {})
+                    merged["runtime_restart"] = restart_result
+                    return True, merged, None
             else:
                 ok, result, error = self._execute_watchdog_http_action(
                     instruction_id=instruction_id,
