@@ -630,6 +630,7 @@ class AgentRuntime:
             "list-instance-data",
             "download-instance-data-file",
             "upload-instance-data-file",
+            "create-instance-data-directory",
             "delete-instance-data-entry",
         ]
 
@@ -3397,6 +3398,54 @@ class AgentRuntime:
             "parent": target.parent.relative_to(data_dir).as_posix() if target.parent != data_dir else "",
         }, None
 
+    def _embedded_create_instance_data_directory(
+        self,
+        slug: str,
+        *,
+        path: str = "",
+        name: str,
+    ) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        safe_name = Path(str(name or "").strip()).name
+        if not safe_name or safe_name in {".", ".."}:
+            return False, {"status_code": 400}, "directory name is required"
+        try:
+            data_dir, target_dir, normalized_relative = self._embedded_resolve_instance_data_path(
+                slug_norm,
+                path,
+                allow_directory=True,
+            )
+        except ValueError as exc:
+            detail = str(exc)
+            code = 404 if "does not exist" in detail else 400
+            return False, {"status_code": code}, detail
+        except Exception as exc:
+            return False, {}, str(exc)
+        if target_dir.exists() and not target_dir.is_dir():
+            return False, {"status_code": 400}, "create path must point to a directory inside data"
+        target = target_dir / safe_name
+        if target.exists():
+            return False, {"status_code": 400}, f"data path '{target.relative_to(data_dir).as_posix()}' already exists"
+        try:
+            target.mkdir(parents=True, exist_ok=False)
+            wd_fs_user = _env("SS14_WD_FS_USER") or _env("SS14_WD_USER") or "ss14"
+            wd_fs_group = _env("SS14_WD_FS_GROUP") or _env("SS14_WD_GROUP") or wd_fs_user
+            self._embedded_fix_ownership(target, wd_fs_user, wd_fs_group, recursive=False)
+            stat_result = target.stat()
+        except Exception as exc:
+            return False, {}, str(exc)
+        return True, {
+            "slug": slug_norm,
+            "root": "data",
+            "path": target.relative_to(data_dir).as_posix(),
+            "name": target.name,
+            "type": "directory",
+            "size": None,
+            "modified_at": float(stat_result.st_mtime),
+            "created": True,
+            "parent": normalized_relative,
+        }, None
+
     def _embedded_fix_ownership(self, path: Path, user: str, group: str, recursive: bool = True) -> None:
         try:
             uid = pwd.getpwnam(user).pw_uid
@@ -5096,6 +5145,12 @@ class AgentRuntime:
                 path=str(payload.get("path") or ""),
                 filename=str(payload.get("filename") or ""),
                 content_base64=str(payload.get("content_base64") or ""),
+            )
+        if kind == "create-instance-data-directory":
+            return self._embedded_create_instance_data_directory(
+                str(payload.get("slug") or ""),
+                path=str(payload.get("path") or ""),
+                name=str(payload.get("name") or ""),
             )
         if kind == "delete-instance-data-entry":
             return self._embedded_delete_instance_data_entry(

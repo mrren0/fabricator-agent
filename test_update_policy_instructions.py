@@ -318,6 +318,11 @@ def test_instance_data_instructions_roundtrip_inside_data_only():
                     "kind": "upload-instance-data-file",
                     "payload": {"slug": slug, "path": "maps", "filename": "new.yml", "content_base64": "eHl6"},
                 })
+                ok_mkdir, mkdir_result, mkdir_error = runtime._execute_instruction({
+                    "id": "inst-mkdir",
+                    "kind": "create-instance-data-directory",
+                    "payload": {"slug": slug, "path": "maps", "name": "subdir"},
+                })
                 ok_delete, delete_result, delete_error = runtime._execute_instruction({
                     "id": "inst-delete",
                     "kind": "delete-instance-data-entry",
@@ -340,6 +345,9 @@ def test_instance_data_instructions_roundtrip_inside_data_only():
     assert ok_upload is True
     assert upload_error is None
     assert upload_result["path"] == "maps/new.yml"
+    assert ok_mkdir is True
+    assert mkdir_error is None
+    assert mkdir_result["path"] == "maps/subdir"
     assert ok_delete is True
     assert delete_error is None
     assert delete_result["deleted"] is True
