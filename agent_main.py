@@ -24,6 +24,7 @@ import subprocess
 import threading
 import time
 import uuid
+from urllib.parse import quote
 from collections import deque
 from functools import lru_cache
 from pathlib import Path
@@ -3258,6 +3259,53 @@ class AgentRuntime:
             "size": len(content),
         }, None
 
+    def _upload_download_transfer_chunks(
+        self,
+        *,
+        instruction_id: str,
+        filename: str,
+        media_type: str,
+        content: bytes,
+    ) -> tuple[bool, dict[str, Any], str | None]:
+        if not self.agent_token:
+            return False, {}, "runtime agent token is missing"
+        transfer_id = str(uuid.uuid4())
+        chunk_size = max(64 * 1024, int(_env("AGENT_RUNTIME_DOWNLOAD_CHUNK_BYTES", "524288") or "524288"))
+        total_size = len(content or b"")
+        url = (
+            f"{self.backend_url}/api/agent/runtime/{quote(self.agent_id, safe='')}/downloads/"
+            f"{quote(transfer_id, safe='')}/chunk"
+        )
+        if total_size == 0:
+            headers = {
+                "X-Agent-Token": self.agent_token or "",
+                "X-Instruction-ID": instruction_id,
+                "X-File-Name": filename,
+                "X-File-Content-Type": media_type,
+                "X-File-Size": "0",
+            }
+            res = requests.post(f"{url}?reset=1&complete=1", data=b"", headers=headers, timeout=self.timeout)
+            res.raise_for_status()
+            return True, {"transfer_id": transfer_id, "size": 0}, None
+        for offset in range(0, total_size, chunk_size):
+            chunk = content[offset:offset + chunk_size]
+            complete = (offset + len(chunk)) >= total_size
+            headers = {
+                "X-Agent-Token": self.agent_token or "",
+                "X-Instruction-ID": instruction_id,
+                "X-File-Name": filename,
+                "X-File-Content-Type": media_type,
+                "X-File-Size": str(total_size),
+                "Content-Type": "application/octet-stream",
+            }
+            query = f"?reset={'1' if offset == 0 else '0'}&complete={'1' if complete else '0'}"
+            try:
+                res = requests.post(f"{url}{query}", data=chunk, headers=headers, timeout=self.timeout)
+                res.raise_for_status()
+            except requests.RequestException as exc:
+                return False, {"transfer_id": transfer_id, "offset": offset, "size": total_size}, str(exc)
+        return True, {"transfer_id": transfer_id, "size": total_size}, None
+
     def _embedded_upload_instance_data_file(
         self,
         slug: str,
@@ -5019,10 +5067,29 @@ class AgentRuntime:
                 str(payload.get("path") or ""),
             )
         if kind == "download-instance-data-file":
-            return self._embedded_download_instance_data_file(
+            ok, result, error = self._embedded_download_instance_data_file(
                 str(payload.get("slug") or ""),
                 str(payload.get("path") or ""),
             )
+            if not ok:
+                return ok, result, error
+            transfer_ok, transfer_result, transfer_error = self._upload_download_transfer_chunks(
+                instruction_id=str(item.get("id") or "").strip() or "-",
+                filename=str(result.get("name") or "download.bin"),
+                media_type=str(result.get("media_type") or "application/octet-stream"),
+                content=base64.b64decode(str(result.get("content_base64") or "").encode("ascii")),
+            )
+            if not transfer_ok:
+                return False, {"transfer": transfer_result, **dict(result or {})}, transfer_error
+            return True, {
+                "slug": str(result.get("slug") or ""),
+                "root": "data",
+                "path": str(result.get("path") or ""),
+                "name": str(result.get("name") or "download.bin"),
+                "media_type": str(result.get("media_type") or "application/octet-stream"),
+                "size": int(result.get("size") or 0),
+                "transfer_id": str(transfer_result.get("transfer_id") or ""),
+            }, None
         if kind == "upload-instance-data-file":
             return self._embedded_upload_instance_data_file(
                 str(payload.get("slug") or ""),

@@ -302,26 +302,27 @@ def test_instance_data_instructions_roundtrip_inside_data_only():
         agent_main.os.environ["SS14_WD_ROOT"] = str(root / "watchdog")
         agent_main.os.environ["SS14_WD_DEDICATED_BASE"] = str(root)
         try:
-            ok_list, list_result, list_error = runtime._execute_instruction({
-                "id": "inst-list",
-                "kind": "list-instance-data",
-                "payload": {"slug": slug, "path": "maps"},
-            })
-            ok_download, download_result, download_error = runtime._execute_instruction({
-                "id": "inst-download",
-                "kind": "download-instance-data-file",
-                "payload": {"slug": slug, "path": "maps/map.yml"},
-            })
-            ok_upload, upload_result, upload_error = runtime._execute_instruction({
-                "id": "inst-upload",
-                "kind": "upload-instance-data-file",
-                "payload": {"slug": slug, "path": "maps", "filename": "new.yml", "content_base64": "eHl6"},
-            })
-            ok_delete, delete_result, delete_error = runtime._execute_instruction({
-                "id": "inst-delete",
-                "kind": "delete-instance-data-entry",
-                "payload": {"slug": slug, "path": "maps/new.yml"},
-            })
+            with patch.object(runtime, "_upload_download_transfer_chunks", return_value=(True, {"transfer_id": "tr-1", "size": 3}, None)):
+                ok_list, list_result, list_error = runtime._execute_instruction({
+                    "id": "inst-list",
+                    "kind": "list-instance-data",
+                    "payload": {"slug": slug, "path": "maps"},
+                })
+                ok_download, download_result, download_error = runtime._execute_instruction({
+                    "id": "inst-download",
+                    "kind": "download-instance-data-file",
+                    "payload": {"slug": slug, "path": "maps/map.yml"},
+                })
+                ok_upload, upload_result, upload_error = runtime._execute_instruction({
+                    "id": "inst-upload",
+                    "kind": "upload-instance-data-file",
+                    "payload": {"slug": slug, "path": "maps", "filename": "new.yml", "content_base64": "eHl6"},
+                })
+                ok_delete, delete_result, delete_error = runtime._execute_instruction({
+                    "id": "inst-delete",
+                    "kind": "delete-instance-data-entry",
+                    "payload": {"slug": slug, "path": "maps/new.yml"},
+                })
         finally:
             for key, value in old.items():
                 if value is None:
@@ -335,7 +336,7 @@ def test_instance_data_instructions_roundtrip_inside_data_only():
     assert list_result["items"][0]["name"] == "map.yml"
     assert ok_download is True
     assert download_error is None
-    assert download_result["content_base64"] == "YWJj"
+    assert download_result["transfer_id"] == "tr-1"
     assert ok_upload is True
     assert upload_error is None
     assert upload_result["path"] == "maps/new.yml"
