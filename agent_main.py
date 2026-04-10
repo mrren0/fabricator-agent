@@ -11,6 +11,7 @@ import ipaddress
 import json
 import logging
 import base64
+import io
 import mimetypes
 import os
 import pwd
@@ -24,6 +25,7 @@ import subprocess
 import threading
 import time
 import uuid
+import zipfile
 from urllib.parse import quote
 from collections import deque
 from functools import lru_cache
@@ -627,6 +629,9 @@ class AgentRuntime:
             "get-instance-database",
             "set-instance-database",
             "reset-instance-sqlite",
+            "download-instance-database-backup",
+            "upload-instance-database-backup",
+            "reset-instance-postgres",
             "list-instance-data",
             "download-instance-data-file",
             "upload-instance-data-file",
@@ -3079,6 +3084,254 @@ class AgentRuntime:
         payload["content_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
         return True, payload, None
 
+    def _embedded_iter_sqlite_database_files(self, instance_dir: Path) -> list[Path]:
+        patterns = (
+            "*.db",
+            "*.db-shm",
+            "*.db-wal",
+            "*.sqlite",
+            "*.sqlite-shm",
+            "*.sqlite-wal",
+            "*.sqlite3",
+            "*.sqlite3-shm",
+            "*.sqlite3-wal",
+        )
+        results: list[Path] = []
+        seen: set[Path] = set()
+        data_dir = instance_dir / "data"
+        search_roots = [instance_dir]
+        if data_dir.exists():
+            search_roots.append(data_dir)
+        for root in search_roots:
+            for pattern in patterns:
+                for candidate in root.glob(pattern):
+                    if candidate in seen or not candidate.is_file():
+                        continue
+                    seen.add(candidate)
+                    results.append(candidate)
+        return results
+
+    def _embedded_postgres_superuser_sql(self, sql: str, *, timeout: int = 90) -> tuple[bool, str]:
+        ok_install, install_error = self._ensure_postgres_installed()
+        if not ok_install:
+            return False, str(install_error or "psql is missing")
+        self._ensure_postgres_service()
+        cmd = self._postgres_superuser_cmd(["-v", "ON_ERROR_STOP=1", "-d", "postgres", "-tAc", sql])
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        except Exception as exc:
+            return False, str(exc)
+        if proc.returncode != 0:
+            tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[-1200:]
+            return False, tail or f"psql exited with code {proc.returncode}"
+        return True, (proc.stdout or "").strip()
+
+    def _embedded_drop_postgres_instance(self, *, dbname: str, username: str) -> tuple[bool, dict[str, Any], str | None]:
+        db_lit = self._pg_literal(dbname)
+        db_ident = self._pg_ident(dbname)
+        role_lit = self._pg_literal(username)
+        role_ident = self._pg_ident(username)
+        ok, out = self._embedded_postgres_superuser_sql(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            f"WHERE datname = {db_lit} AND pid <> pg_backend_pid();"
+        )
+        if not ok:
+            return False, {"dropped": False}, out
+        ok, out = self._embedded_postgres_superuser_sql(f"DROP DATABASE IF EXISTS {db_ident};", timeout=120)
+        if not ok:
+            return False, {"dropped": False}, out
+        ok, out = self._embedded_postgres_superuser_sql(f"DROP ROLE IF EXISTS {role_ident};")
+        if not ok:
+            return False, {"dropped": False}, out
+        return True, {"dropped": True, "pg_database": dbname, "pg_username": username}, None
+
+    def _embedded_download_instance_database_backup(self, slug: str) -> tuple[bool, dict[str, Any], str | None]:
+        ok, info, error = self._embedded_get_instance_database(slug)
+        if not ok:
+            return ok, info, error
+        slug_norm = str(info.get("slug") or str(slug or "").strip().lower())
+        mode = str(info.get("mode") or "sqlite").strip().lower()
+        try:
+            cfg_path = self._embedded_instance_config_path(slug_norm)
+        except ValueError as exc:
+            return False, {"status_code": 404}, str(exc)
+        instance_dir = cfg_path.parent
+        buf = io.BytesIO()
+        try:
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("meta.json", json.dumps({"slug": slug_norm, "mode": mode}, ensure_ascii=True).encode("utf-8"))
+                if mode == "sqlite":
+                    files = self._embedded_iter_sqlite_database_files(instance_dir)
+                    if not files:
+                        return False, {"status_code": 404}, "sqlite database files were not found"
+                    for file_path in files:
+                        archive.writestr(f"files/{file_path.relative_to(instance_dir).as_posix()}", file_path.read_bytes())
+                else:
+                    pg = info.get("postgres") if isinstance(info.get("postgres"), dict) else {}
+                    env = dict(os.environ)
+                    env["PGPASSWORD"] = str(pg.get("pg_password") or "")
+                    cmd = [
+                        "pg_dump",
+                        "--no-owner",
+                        "--no-privileges",
+                        "-h",
+                        str(pg.get("pg_host") or "127.0.0.1"),
+                        "-p",
+                        str(pg.get("pg_port") or 5432),
+                        "-U",
+                        str(pg.get("pg_username") or slug_norm),
+                        "-d",
+                        str(pg.get("pg_database") or slug_norm),
+                    ]
+                    proc = subprocess.run(cmd, capture_output=True, env=env, check=False, timeout=120)
+                    if proc.returncode != 0:
+                        tail = ((proc.stdout or b"") + b"\n" + (proc.stderr or b"")).decode("utf-8", errors="ignore").strip()[-1500:]
+                        return False, {}, tail or f"pg_dump exited with code {proc.returncode}"
+                    archive.writestr("dump.sql", proc.stdout or b"")
+        except Exception as exc:
+            return False, {}, str(exc)
+        content = buf.getvalue()
+        return True, {
+            "slug": slug_norm,
+            "mode": mode,
+            "name": f"{slug_norm}-{mode}-backup.zip",
+            "media_type": "application/zip",
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "size": len(content),
+        }, None
+
+    def _embedded_restore_instance_database_backup(
+        self,
+        slug: str,
+        *,
+        filename: str,
+        content_base64: str,
+    ) -> tuple[bool, dict[str, Any], str | None]:
+        ok, info, error = self._embedded_get_instance_database(slug)
+        if not ok:
+            return ok, info, error
+        slug_norm = str(info.get("slug") or str(slug or "").strip().lower())
+        mode = str(info.get("mode") or "sqlite").strip().lower()
+        try:
+            content = base64.b64decode(str(content_base64 or "").encode("ascii"), validate=True)
+        except Exception:
+            return False, {"status_code": 400}, "content_base64 must be valid base64"
+        try:
+            cfg_path = self._embedded_instance_config_path(slug_norm)
+        except ValueError as exc:
+            return False, {"status_code": 404}, str(exc)
+        instance_dir = cfg_path.parent
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(content), "r")
+        except Exception as exc:
+            return False, {"status_code": 400}, f"invalid backup archive: {exc}"
+        with archive:
+            if mode == "sqlite":
+                for file_path in self._embedded_iter_sqlite_database_files(instance_dir):
+                    try:
+                        file_path.unlink(missing_ok=True)
+                    except FileNotFoundError:
+                        pass
+                restored_paths: list[str] = []
+                for member in archive.infolist():
+                    name = str(member.filename or "").strip()
+                    if not name or member.is_dir() or not name.startswith("files/"):
+                        continue
+                    relative = name[len("files/"):].strip().replace("\\", "/")
+                    parts = [part for part in relative.split("/") if part and part != "."]
+                    if not parts or any(part == ".." for part in parts):
+                        return False, {"status_code": 400}, "backup archive contains invalid sqlite file path"
+                    target = instance_dir.joinpath(*parts)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(archive.read(member))
+                    wd_fs_user = _env("SS14_WD_FS_USER") or _env("SS14_WD_USER") or "ss14"
+                    wd_fs_group = _env("SS14_WD_FS_GROUP") or _env("SS14_WD_GROUP") or wd_fs_user
+                    self._embedded_fix_ownership(target.parent, wd_fs_user, wd_fs_group, recursive=False)
+                    self._embedded_fix_ownership(target, wd_fs_user, wd_fs_group, recursive=False)
+                    restored_paths.append(target.relative_to(instance_dir).as_posix())
+                if not restored_paths:
+                    return False, {"status_code": 400}, "backup archive does not contain sqlite database files"
+                ok_now, result, error_now = self._embedded_get_instance_database(slug_norm)
+                if not ok_now:
+                    return ok_now, result, error_now
+                result["restored"] = True
+                result["restored_paths"] = restored_paths
+                result["backup_name"] = Path(str(filename or "").strip()).name or "database-backup.zip"
+                return True, result, None
+
+            try:
+                dump_bytes = archive.read("dump.sql")
+            except KeyError:
+                return False, {"status_code": 400}, "backup archive does not contain dump.sql"
+            pg = info.get("postgres") if isinstance(info.get("postgres"), dict) else {}
+            drop_ok, drop_meta, drop_error = self._embedded_drop_postgres_instance(
+                dbname=str(pg.get("pg_database") or slug_norm),
+                username=str(pg.get("pg_username") or slug_norm),
+            )
+            if not drop_ok:
+                return False, {"drop": drop_meta}, str(drop_error or "failed to drop postgres database")
+            prov_ok, prov_meta, prov_error = self._embedded_postgres_provision(
+                dbname=str(pg.get("pg_database") or slug_norm),
+                username=str(pg.get("pg_username") or slug_norm),
+                password=str(pg.get("pg_password") or ""),
+            )
+            if not prov_ok:
+                return False, {"provision": prov_meta}, str(prov_error or "failed to provision postgres database")
+            env = dict(os.environ)
+            env["PGPASSWORD"] = str(pg.get("pg_password") or "")
+            cmd = [
+                "psql",
+                "-h",
+                str(pg.get("pg_host") or "127.0.0.1"),
+                "-p",
+                str(pg.get("pg_port") or 5432),
+                "-U",
+                str(pg.get("pg_username") or slug_norm),
+                "-d",
+                str(pg.get("pg_database") or slug_norm),
+                "-v",
+                "ON_ERROR_STOP=1",
+            ]
+            proc = subprocess.run(cmd, input=dump_bytes, capture_output=True, env=env, check=False, timeout=180)
+            if proc.returncode != 0:
+                tail = ((proc.stdout or b"") + b"\n" + (proc.stderr or b"")).decode("utf-8", errors="ignore").strip()[-1500:]
+                return False, {}, tail or f"psql exited with code {proc.returncode}"
+            ok_now, result, error_now = self._embedded_get_instance_database(slug_norm)
+            if not ok_now:
+                return ok_now, result, error_now
+            result["restored"] = True
+            result["backup_name"] = Path(str(filename or "").strip()).name or "database-backup.zip"
+            return True, result, None
+
+    def _embedded_reset_instance_postgres(self, slug: str) -> tuple[bool, dict[str, Any], str | None]:
+        ok, info, error = self._embedded_get_instance_database(slug)
+        if not ok:
+            return ok, info, error
+        slug_norm = str(info.get("slug") or str(slug or "").strip().lower())
+        if str(info.get("mode") or "").strip().lower() != "postgres":
+            return False, {"status_code": 400}, "postgres reset is available only when database mode is postgres"
+        pg = info.get("postgres") if isinstance(info.get("postgres"), dict) else {}
+        drop_ok, drop_meta, drop_error = self._embedded_drop_postgres_instance(
+            dbname=str(pg.get("pg_database") or slug_norm),
+            username=str(pg.get("pg_username") or slug_norm),
+        )
+        if not drop_ok:
+            return False, {"drop": drop_meta}, str(drop_error or "failed to drop postgres database")
+        prov_ok, prov_meta, prov_error = self._embedded_postgres_provision(
+            dbname=str(pg.get("pg_database") or slug_norm),
+            username=str(pg.get("pg_username") or slug_norm),
+            password=str(pg.get("pg_password") or ""),
+        )
+        if not prov_ok:
+            return False, {"provision": prov_meta}, str(prov_error or "failed to provision postgres database")
+        ok_now, result, error_now = self._embedded_get_instance_database(slug_norm)
+        if not ok_now:
+            return ok_now, result, error_now
+        result["updated"] = True
+        result["drop"] = drop_meta
+        result["provision"] = prov_meta
+        return True, result, None
+
     def _embedded_reset_instance_sqlite(
         self,
         slug: str,
@@ -5110,6 +5363,34 @@ class AgentRuntime:
                 delete_database=bool(payload.get("delete_database")),
                 delete_data=bool(payload.get("delete_data")),
             )
+        if kind == "download-instance-database-backup":
+            ok, result, error = self._embedded_download_instance_database_backup(str(payload.get("slug") or ""))
+            if not ok:
+                return ok, result, error
+            transfer_ok, transfer_result, transfer_error = self._upload_download_transfer_chunks(
+                instruction_id=str(item.get("id") or "").strip() or "-",
+                filename=str(result.get("name") or "database-backup.zip"),
+                media_type=str(result.get("media_type") or "application/octet-stream"),
+                content=base64.b64decode(str(result.get("content_base64") or "").encode("ascii")),
+            )
+            if not transfer_ok:
+                return False, {"transfer": transfer_result, **dict(result or {})}, transfer_error
+            return True, {
+                "slug": str(result.get("slug") or ""),
+                "mode": str(result.get("mode") or ""),
+                "name": str(result.get("name") or "database-backup.zip"),
+                "media_type": str(result.get("media_type") or "application/octet-stream"),
+                "size": int(result.get("size") or 0),
+                "transfer_id": str(transfer_result.get("transfer_id") or ""),
+            }, None
+        if kind == "upload-instance-database-backup":
+            return self._embedded_restore_instance_database_backup(
+                str(payload.get("slug") or ""),
+                filename=str(payload.get("filename") or ""),
+                content_base64=str(payload.get("content_base64") or ""),
+            )
+        if kind == "reset-instance-postgres":
+            return self._embedded_reset_instance_postgres(str(payload.get("slug") or ""))
         if kind == "list-instance-data":
             return self._embedded_list_instance_data(
                 str(payload.get("slug") or ""),

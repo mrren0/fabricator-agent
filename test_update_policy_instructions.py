@@ -29,6 +29,9 @@ def test_supported_instruction_kinds_include_update_policy():
     assert "get-instance-update-policy" in kinds
     assert "set-instance-update-policy" in kinds
     assert "reset-instance-sqlite" in kinds
+    assert "download-instance-database-backup" in kinds
+    assert "upload-instance-database-backup" in kinds
+    assert "reset-instance-postgres" in kinds
     assert "list-instance-data" in kinds
     assert "download-instance-data-file" in kinds
     assert "upload-instance-data-file" in kinds
@@ -351,3 +354,47 @@ def test_instance_data_instructions_roundtrip_inside_data_only():
     assert ok_delete is True
     assert delete_error is None
     assert delete_result["deleted"] is True
+
+
+def test_instance_database_backup_roundtrip_sqlite():
+    runtime = _runtime()
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        slug = "srv-1"
+        wd_root = root / "watchdog-srv-1"
+        inst_dir = wd_root / "instances" / slug
+        (inst_dir / "data").mkdir(parents=True, exist_ok=True)
+        (inst_dir / "players.db").write_text("sqlite-one", encoding="utf-8")
+        (inst_dir / "data" / "server.db").write_text("sqlite-two", encoding="utf-8")
+        (inst_dir / "config.toml").write_text('[database]\nengine = "sqlite"\n', encoding="utf-8")
+        old = {k: agent_main.os.environ.get(k) for k in ("SS14_WD_ROOT", "SS14_WD_DEDICATED_BASE")}
+        agent_main.os.environ["SS14_WD_ROOT"] = str(root / "watchdog")
+        agent_main.os.environ["SS14_WD_DEDICATED_BASE"] = str(root)
+        try:
+            with patch.object(runtime, "_upload_download_transfer_chunks", return_value=(True, {"transfer_id": "db-tr-1", "size": 12}, None)):
+                ok_download, download_result, download_error = runtime._execute_instruction({
+                    "id": "db-download",
+                    "kind": "download-instance-database-backup",
+                    "payload": {"slug": slug},
+                })
+                backup_b64 = runtime._embedded_download_instance_database_backup(slug)[1]["content_base64"]
+                (inst_dir / "players.db").unlink()
+                (inst_dir / "data" / "server.db").unlink()
+                ok_restore, restore_result, restore_error = runtime._execute_instruction({
+                    "id": "db-restore",
+                    "kind": "upload-instance-database-backup",
+                    "payload": {"slug": slug, "filename": "backup.zip", "content_base64": backup_b64},
+                })
+        finally:
+            for key, value in old.items():
+                if value is None:
+                    agent_main.os.environ.pop(key, None)
+                else:
+                    agent_main.os.environ[key] = value
+
+    assert ok_download is True
+    assert download_error is None
+    assert download_result["transfer_id"] == "db-tr-1"
+    assert ok_restore is True
+    assert restore_error is None
+    assert restore_result["restored"] is True
