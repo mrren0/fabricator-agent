@@ -629,6 +629,7 @@ class AgentRuntime:
             "list-instance-data",
             "download-instance-data-file",
             "upload-instance-data-file",
+            "delete-instance-data-entry",
         ]
 
     def _resolve_agent_id(self) -> str:
@@ -3291,6 +3292,10 @@ class AgentRuntime:
             target_dir.mkdir(parents=True, exist_ok=True)
             target = target_dir / safe_name
             target.write_bytes(content)
+            wd_fs_user = _env("SS14_WD_FS_USER") or _env("SS14_WD_USER") or "ss14"
+            wd_fs_group = _env("SS14_WD_FS_GROUP") or _env("SS14_WD_GROUP") or wd_fs_user
+            self._embedded_fix_ownership(target_dir, wd_fs_user, wd_fs_group, recursive=False)
+            self._embedded_fix_ownership(target, wd_fs_user, wd_fs_group, recursive=False)
             stat_result = target.stat()
         except Exception as exc:
             return False, {}, str(exc)
@@ -3304,6 +3309,44 @@ class AgentRuntime:
             "modified_at": float(stat_result.st_mtime),
             "uploaded": True,
             "directory": normalized_relative,
+        }, None
+
+    def _embedded_delete_instance_data_entry(self, slug: str, path: str) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        try:
+            data_dir, target, normalized_relative = self._embedded_resolve_instance_data_path(
+                slug_norm,
+                path,
+                allow_directory=True,
+            )
+        except ValueError as exc:
+            detail = str(exc)
+            code = 404 if "does not exist" in detail else 400
+            return False, {"status_code": code}, detail
+        except Exception as exc:
+            return False, {}, str(exc)
+        if not normalized_relative:
+            return False, {"status_code": 400}, "refusing to delete data root"
+        if not target.exists():
+            return False, {"status_code": 404}, f"data path '{normalized_relative}' does not exist"
+        entry_type = "directory" if target.is_dir() else "file"
+        try:
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=False)
+            else:
+                target.unlink()
+        except FileNotFoundError:
+            return False, {"status_code": 404}, f"data path '{normalized_relative}' does not exist"
+        except Exception as exc:
+            return False, {}, str(exc)
+        return True, {
+            "slug": slug_norm,
+            "root": "data",
+            "path": normalized_relative,
+            "name": target.name,
+            "type": entry_type,
+            "deleted": True,
+            "parent": target.parent.relative_to(data_dir).as_posix() if target.parent != data_dir else "",
         }, None
 
     def _embedded_fix_ownership(self, path: Path, user: str, group: str, recursive: bool = True) -> None:
@@ -4986,6 +5029,11 @@ class AgentRuntime:
                 path=str(payload.get("path") or ""),
                 filename=str(payload.get("filename") or ""),
                 content_base64=str(payload.get("content_base64") or ""),
+            )
+        if kind == "delete-instance-data-entry":
+            return self._embedded_delete_instance_data_entry(
+                str(payload.get("slug") or ""),
+                str(payload.get("path") or ""),
             )
         if kind in {"restart-instance", "update-instance", "stop-instance"}:
             instruction_id = str(item.get("id") or "").strip() or "-"

@@ -317,6 +317,11 @@ def test_instance_data_instructions_roundtrip_inside_data_only():
                 "kind": "upload-instance-data-file",
                 "payload": {"slug": slug, "path": "maps", "filename": "new.yml", "content_base64": "eHl6"},
             })
+            ok_delete, delete_result, delete_error = runtime._execute_instruction({
+                "id": "inst-delete",
+                "kind": "delete-instance-data-entry",
+                "payload": {"slug": slug, "path": "maps/new.yml"},
+            })
         finally:
             for key, value in old.items():
                 if value is None:
@@ -334,3 +339,6 @@ def test_instance_data_instructions_roundtrip_inside_data_only():
     assert ok_upload is True
     assert upload_error is None
     assert upload_result["path"] == "maps/new.yml"
+    assert ok_delete is True
+    assert delete_error is None
+    assert delete_result["deleted"] is True
