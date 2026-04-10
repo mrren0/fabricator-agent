@@ -29,6 +29,9 @@ def test_supported_instruction_kinds_include_update_policy():
     assert "get-instance-update-policy" in kinds
     assert "set-instance-update-policy" in kinds
     assert "reset-instance-sqlite" in kinds
+    assert "list-instance-data" in kinds
+    assert "download-instance-data-file" in kinds
+    assert "upload-instance-data-file" in kinds
 
 
 def test_execute_instruction_get_instance_update_policy_uses_embedded_fragment():
@@ -283,3 +286,51 @@ def test_database_values_ignore_commented_postgres_lines():
     )
 
     assert values["engine"] == ""
+
+
+def test_instance_data_instructions_roundtrip_inside_data_only():
+    runtime = _runtime()
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        slug = "srv-1"
+        wd_root = root / "watchdog-srv-1"
+        inst_dir = wd_root / "instances" / slug
+        (inst_dir / "data" / "maps").mkdir(parents=True, exist_ok=True)
+        (inst_dir / "data" / "maps" / "map.yml").write_text("abc", encoding="utf-8")
+        (inst_dir / "config.toml").write_text('[game]\nhostname = "srv-1"\n', encoding="utf-8")
+        old = {k: agent_main.os.environ.get(k) for k in ("SS14_WD_ROOT", "SS14_WD_DEDICATED_BASE")}
+        agent_main.os.environ["SS14_WD_ROOT"] = str(root / "watchdog")
+        agent_main.os.environ["SS14_WD_DEDICATED_BASE"] = str(root)
+        try:
+            ok_list, list_result, list_error = runtime._execute_instruction({
+                "id": "inst-list",
+                "kind": "list-instance-data",
+                "payload": {"slug": slug, "path": "maps"},
+            })
+            ok_download, download_result, download_error = runtime._execute_instruction({
+                "id": "inst-download",
+                "kind": "download-instance-data-file",
+                "payload": {"slug": slug, "path": "maps/map.yml"},
+            })
+            ok_upload, upload_result, upload_error = runtime._execute_instruction({
+                "id": "inst-upload",
+                "kind": "upload-instance-data-file",
+                "payload": {"slug": slug, "path": "maps", "filename": "new.yml", "content_base64": "eHl6"},
+            })
+        finally:
+            for key, value in old.items():
+                if value is None:
+                    agent_main.os.environ.pop(key, None)
+                else:
+                    agent_main.os.environ[key] = value
+
+    assert ok_list is True
+    assert list_error is None
+    assert list_result["path"] == "maps"
+    assert list_result["items"][0]["name"] == "map.yml"
+    assert ok_download is True
+    assert download_error is None
+    assert download_result["content_base64"] == "YWJj"
+    assert ok_upload is True
+    assert upload_error is None
+    assert upload_result["path"] == "maps/new.yml"

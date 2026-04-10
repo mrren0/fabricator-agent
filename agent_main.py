@@ -10,6 +10,8 @@ import hashlib
 import ipaddress
 import json
 import logging
+import base64
+import mimetypes
 import os
 import pwd
 import grp
@@ -624,6 +626,9 @@ class AgentRuntime:
             "get-instance-database",
             "set-instance-database",
             "reset-instance-sqlite",
+            "list-instance-data",
+            "download-instance-data-file",
+            "upload-instance-data-file",
         ]
 
     def _resolve_agent_id(self) -> str:
@@ -3145,6 +3150,162 @@ class AgentRuntime:
         result["content_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
         return True, result, None
 
+    def _embedded_resolve_instance_data_path(
+        self,
+        slug: str,
+        relative_path: str = "",
+        *,
+        allow_directory: bool = True,
+    ) -> tuple[Path, Path, str]:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            raise ValueError("slug is required")
+        cfg_path = self._embedded_instance_config_path(slug_norm)
+        instance_dir = cfg_path.parent
+        data_dir = instance_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        raw_relative = str(relative_path or "").replace("\\", "/").strip()
+        cleaned_parts: list[str] = []
+        for part in raw_relative.split("/"):
+            piece = str(part or "").strip()
+            if not piece or piece == ".":
+                continue
+            if piece == "..":
+                raise ValueError("path must stay inside data")
+            cleaned_parts.append(piece)
+        normalized_relative = "/".join(cleaned_parts)
+        target = data_dir.joinpath(*cleaned_parts) if cleaned_parts else data_dir
+        try:
+            target.relative_to(data_dir)
+        except ValueError as exc:
+            raise ValueError("path must stay inside data") from exc
+        if target.exists():
+            if target.is_dir() and not allow_directory:
+                raise ValueError("path must point to a file inside data")
+        elif not allow_directory and normalized_relative.endswith("/"):
+            raise ValueError("path must point to a file inside data")
+        return data_dir, target, normalized_relative
+
+    def _embedded_list_instance_data(self, slug: str, path: str = "") -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        try:
+            data_dir, target, normalized_relative = self._embedded_resolve_instance_data_path(
+                slug_norm,
+                path,
+                allow_directory=True,
+            )
+        except ValueError as exc:
+            detail = str(exc)
+            code = 404 if "does not exist" in detail else 400
+            return False, {"status_code": code}, detail
+        except Exception as exc:
+            return False, {}, str(exc)
+        if not target.exists():
+            return False, {"status_code": 404}, f"data path '{normalized_relative or '.'}' does not exist"
+        if not target.is_dir():
+            return False, {"status_code": 400}, "data path must point to a directory"
+        items: list[dict[str, Any]] = []
+        for entry in sorted(target.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
+            stat_result = entry.stat()
+            items.append(
+                {
+                    "name": entry.name,
+                    "path": entry.relative_to(data_dir).as_posix(),
+                    "type": "directory" if entry.is_dir() else "file",
+                    "size": None if entry.is_dir() else int(stat_result.st_size),
+                    "modified_at": float(stat_result.st_mtime),
+                }
+            )
+        return True, {
+            "slug": slug_norm,
+            "root": "data",
+            "path": normalized_relative,
+            "items": items,
+        }, None
+
+    def _embedded_download_instance_data_file(self, slug: str, path: str) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        try:
+            _, target, normalized_relative = self._embedded_resolve_instance_data_path(
+                slug_norm,
+                path,
+                allow_directory=False,
+            )
+        except ValueError as exc:
+            detail = str(exc)
+            code = 404 if "does not exist" in detail else 400
+            return False, {"status_code": code}, detail
+        except Exception as exc:
+            return False, {}, str(exc)
+        if not target.exists():
+            return False, {"status_code": 404}, f"data file '{normalized_relative}' does not exist"
+        if not target.is_file():
+            return False, {"status_code": 400}, "path must point to a file inside data"
+        media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        try:
+            content = target.read_bytes()
+        except Exception as exc:
+            return False, {}, str(exc)
+        return True, {
+            "slug": slug_norm,
+            "root": "data",
+            "path": normalized_relative,
+            "name": target.name,
+            "media_type": media_type,
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "size": len(content),
+        }, None
+
+    def _embedded_upload_instance_data_file(
+        self,
+        slug: str,
+        *,
+        path: str = "",
+        filename: str,
+        content_base64: str,
+    ) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        safe_name = Path(str(filename or "").strip()).name
+        if not safe_name or safe_name in {".", ".."}:
+            return False, {"status_code": 400}, "filename is required"
+        try:
+            content = base64.b64decode(str(content_base64 or "").encode("ascii"), validate=True)
+        except Exception:
+            return False, {"status_code": 400}, "content_base64 must be valid base64"
+        try:
+            data_dir, target_dir, normalized_relative = self._embedded_resolve_instance_data_path(
+                slug_norm,
+                path,
+                allow_directory=True,
+            )
+        except ValueError as exc:
+            detail = str(exc)
+            code = 404 if "does not exist" in detail else 400
+            return False, {"status_code": code}, detail
+        except Exception as exc:
+            return False, {}, str(exc)
+        if target_dir.exists() and not target_dir.is_dir():
+            return False, {"status_code": 400}, "upload path must point to a directory inside data"
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / safe_name
+            target.write_bytes(content)
+            stat_result = target.stat()
+        except Exception as exc:
+            return False, {}, str(exc)
+        return True, {
+            "slug": slug_norm,
+            "root": "data",
+            "path": target.relative_to(data_dir).as_posix(),
+            "name": target.name,
+            "type": "file",
+            "size": int(stat_result.st_size),
+            "modified_at": float(stat_result.st_mtime),
+            "uploaded": True,
+            "directory": normalized_relative,
+        }, None
+
     def _embedded_fix_ownership(self, path: Path, user: str, group: str, recursive: bool = True) -> None:
         try:
             uid = pwd.getpwnam(user).pw_uid
@@ -4808,6 +4969,23 @@ class AgentRuntime:
                 str(payload.get("slug") or ""),
                 delete_database=bool(payload.get("delete_database")),
                 delete_data=bool(payload.get("delete_data")),
+            )
+        if kind == "list-instance-data":
+            return self._embedded_list_instance_data(
+                str(payload.get("slug") or ""),
+                str(payload.get("path") or ""),
+            )
+        if kind == "download-instance-data-file":
+            return self._embedded_download_instance_data_file(
+                str(payload.get("slug") or ""),
+                str(payload.get("path") or ""),
+            )
+        if kind == "upload-instance-data-file":
+            return self._embedded_upload_instance_data_file(
+                str(payload.get("slug") or ""),
+                path=str(payload.get("path") or ""),
+                filename=str(payload.get("filename") or ""),
+                content_base64=str(payload.get("content_base64") or ""),
             )
         if kind in {"restart-instance", "update-instance", "stop-instance"}:
             instruction_id = str(item.get("id") or "").strip() or "-"
