@@ -281,6 +281,61 @@ def test_reset_instance_sqlite_removes_data_directory():
     assert any(path.endswith("data") for path in result["deleted_paths"])
 
 
+def test_gentle_wait_proceeds_immediately_when_players_are_zero():
+    runtime = _runtime()
+
+    with patch.object(
+        runtime,
+        "_embedded_instance_status_snapshot",
+        return_value={
+            "active": True,
+            "status": "online",
+            "players": 0,
+            "max_players": 30,
+        },
+    ) as snapshot_mock:
+        ok, result, error = runtime._wait_for_instance_empty_if_needed(
+            instruction_id="inst-g1",
+            kind="restart-instance",
+            slug="srv-1",
+            payload={"slug": "srv-1", "schedule_mode": "gentle"},
+        )
+
+    assert ok is True
+    assert error is None
+    assert result["mode"] == "gentle"
+    assert result["players"] == 0
+    snapshot_mock.assert_called_once_with("srv-1")
+
+
+def test_execute_instruction_restart_includes_gentle_wait_metadata():
+    runtime = _runtime()
+
+    with patch.object(
+        runtime,
+        "_wait_for_instance_empty_if_needed",
+        return_value=(True, {"mode": "gentle", "players": 0, "waited_seconds": 0.0}, None),
+    ) as wait_mock:
+        with patch.object(
+            runtime,
+            "_execute_watchdog_service_restart",
+            return_value=(True, {"status_code": 200, "service": "SS14.Watchdog-srv-1"}, None),
+        ) as restart_mock:
+            ok, result, error = runtime._execute_instruction(
+                {
+                    "id": "inst-g2",
+                    "kind": "restart-instance",
+                    "payload": {"slug": "srv-1", "schedule_mode": "gentle"},
+                }
+            )
+
+    assert ok is True
+    assert error is None
+    assert result["schedule_wait"]["mode"] == "gentle"
+    wait_mock.assert_called_once()
+    restart_mock.assert_called_once()
+
+
 def test_database_values_ignore_commented_postgres_lines():
     runtime = _runtime()
 

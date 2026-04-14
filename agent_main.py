@@ -5155,6 +5155,118 @@ class AgentRuntime:
             "watchdog api call failed",
         )
 
+    @staticmethod
+    def _instruction_schedule_mode(payload: dict[str, Any] | None) -> str:
+        if not isinstance(payload, dict):
+            return "force"
+        direct = str(payload.get("schedule_mode") or payload.get("mode") or "").strip().lower()
+        if direct in {"gentle", "force"}:
+            return direct
+        recurrence = payload.get("recurrence") if isinstance(payload.get("recurrence"), dict) else {}
+        nested = str(recurrence.get("mode") or "").strip().lower()
+        return "gentle" if nested == "gentle" else "force"
+
+    def _embedded_instance_status_snapshot(self, slug: str) -> dict[str, Any]:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            return {
+                "active": False,
+                "status_code": 0,
+                "body": self._compact_status_body(status="offline", name=None, players=0, max_players=None),
+                "url": "",
+                "error": "missing slug",
+                "status": "offline",
+                "name": None,
+                "players": 0,
+                "max_players": None,
+            }
+        cfg_path = self._embedded_instance_config_path(slug_norm)
+        if not cfg_path.is_file():
+            return {
+                "active": False,
+                "status_code": 0,
+                "body": self._compact_status_body(status="offline", name=slug_norm, players=0, max_players=None),
+                "url": "",
+                "error": f"config not found: {cfg_path}",
+                "status": "offline",
+                "name": slug_norm,
+                "players": 0,
+                "max_players": None,
+            }
+        meta = self._read_embedded_instance_meta(slug_norm, cfg_path)
+        return self._probe_embedded_instance_status(
+            slug=slug_norm,
+            port=int(meta.get("port") or 0),
+            configured_name=str(meta.get("name") or "").strip() or None,
+            configured_max_players=self._safe_int(meta.get("max_players")),
+        )
+
+    def _wait_for_instance_empty_if_needed(
+        self,
+        *,
+        instruction_id: str,
+        kind: str,
+        slug: str,
+        payload: dict[str, Any] | None,
+    ) -> tuple[bool, dict[str, Any] | None, str | None]:
+        mode = self._instruction_schedule_mode(payload)
+        if mode != "gentle":
+            return True, None, None
+        timeout_default = max(30.0, float(self.timeout))
+        try:
+            timeout_seconds = max(5.0, float(_env("AGENT_GENTLE_ACTION_TIMEOUT_SECONDS", str(max(21600.0, timeout_default))) or str(max(21600.0, timeout_default))))
+        except Exception:
+            timeout_seconds = max(21600.0, timeout_default)
+        try:
+            poll_seconds = max(1.0, float(_env("AGENT_GENTLE_ACTION_POLL_SECONDS", "30") or "30"))
+        except Exception:
+            poll_seconds = 30.0
+        slug_norm = str(slug or "").strip().lower()
+        started_at = time.time()
+        deadline = started_at + timeout_seconds
+        last_snapshot: dict[str, Any] | None = None
+        while True:
+            snapshot = self._embedded_instance_status_snapshot(slug_norm)
+            last_snapshot = snapshot
+            active = bool(snapshot.get("active"))
+            players_raw = snapshot.get("players")
+            try:
+                players = int(players_raw) if players_raw is not None else 0
+            except Exception:
+                players = 0
+            if not active or players <= 0:
+                waited = {
+                    "mode": "gentle",
+                    "waited_seconds": round(max(0.0, time.time() - started_at), 3),
+                    "players": max(0, players),
+                    "max_players": self._safe_int(snapshot.get("max_players")),
+                    "status": str(snapshot.get("status") or "").strip().lower() or ("online" if active else "offline"),
+                }
+                logger.info(
+                    "Instruction id=%s kind=%s slug=%s gentle wait satisfied active=%s players=%s waited_seconds=%.3f",
+                    instruction_id,
+                    kind,
+                    slug_norm,
+                    active,
+                    players,
+                    waited["waited_seconds"],
+                )
+                return True, waited, None
+            if time.time() >= deadline:
+                return (
+                    False,
+                    {
+                        "mode": "gentle",
+                        "players": players,
+                        "max_players": self._safe_int(snapshot.get("max_players")),
+                        "status": str(snapshot.get("status") or "").strip().lower() or ("online" if active else "offline"),
+                        "waited_seconds": round(max(0.0, time.time() - started_at), 3),
+                        "last_snapshot": snapshot,
+                    },
+                    f"gentle mode timed out waiting for players to leave: slug={slug_norm} players={players} timeout_seconds={int(round(timeout_seconds))}",
+                )
+            time.sleep(min(poll_seconds, max(0.2, deadline - time.time())))
+
     def _execute_watchdog_service_restart(
         self,
         *,
@@ -5441,6 +5553,14 @@ class AgentRuntime:
         if kind in {"restart-instance", "update-instance", "stop-instance"}:
             instruction_id = str(item.get("id") or "").strip() or "-"
             slug = str(payload.get("slug") or "").strip()
+            wait_ok, wait_meta, wait_error = self._wait_for_instance_empty_if_needed(
+                instruction_id=instruction_id,
+                kind=kind,
+                slug=slug,
+                payload=payload if isinstance(payload, dict) else None,
+            )
+            if not wait_ok:
+                return False, dict(wait_meta or {}), wait_error
             if kind == "restart-instance":
                 ok, result, error = self._execute_watchdog_service_restart(
                     instruction_id=instruction_id,
@@ -5468,6 +5588,8 @@ class AgentRuntime:
                         return False, merged, f"watchdog update succeeded and .NET runtime was installed, but restart failed: {restart_error}"
                     merged = dict(result or {})
                     merged["runtime_restart"] = restart_result
+                    if wait_meta:
+                        merged["schedule_wait"] = wait_meta
                     return True, merged, None
             else:
                 ok, result, error = self._execute_watchdog_http_action(
@@ -5478,6 +5600,9 @@ class AgentRuntime:
                     reason=str(payload.get("reason") or "").strip() or None,
                 )
             if ok:
+                if wait_meta and isinstance(result, dict):
+                    result = dict(result or {})
+                    result["schedule_wait"] = wait_meta
                 return True, result, None
             if kind == "stop-instance" and _env_bool("AGENT_WATCHDOG_STOP_SYSTEMCTL_FALLBACK", True):
                 stop_ok, stop_result, stop_error = self._execute_watchdog_service_stop(
@@ -5490,6 +5615,8 @@ class AgentRuntime:
                     merged["fallback"] = "systemctl-stop"
                     merged["watchdog_http_error"] = error
                     merged["watchdog_http_result"] = result
+                    if wait_meta:
+                        merged["schedule_wait"] = wait_meta
                     logger.warning(
                         "Instruction id=%s kind=%s slug=%s direct watchdog HTTP failed; systemctl stop fallback succeeded",
                         instruction_id,
