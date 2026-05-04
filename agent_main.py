@@ -637,6 +637,8 @@ class AgentRuntime:
             "upload-instance-data-file",
             "create-instance-data-directory",
             "delete-instance-data-entry",
+            "download-instance-full-snapshot",
+            "upload-instance-full-snapshot",
         ]
 
     def _resolve_agent_id(self) -> str:
@@ -3613,6 +3615,203 @@ class AgentRuntime:
             "directory": normalized_relative,
         }, None
 
+    def _embedded_download_instance_full_snapshot(self, slug: str) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        ok, info, error = self._embedded_get_instance_database(slug_norm)
+        if not ok:
+            return ok, info, error
+        db_mode = str(info.get("mode") or "sqlite").strip().lower()
+        try:
+            cfg_path = self._embedded_instance_config_path(slug_norm)
+        except ValueError as exc:
+            return False, {"status_code": 404}, str(exc)
+        instance_dir = cfg_path.parent
+        buf = io.BytesIO()
+        try:
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(
+                    "meta.json",
+                    json.dumps({"slug": slug_norm, "version": 1, "db_mode": db_mode}, ensure_ascii=True).encode("utf-8"),
+                )
+                if cfg_path.exists():
+                    archive.writestr("config.toml", cfg_path.read_bytes())
+                if db_mode == "sqlite":
+                    for file_path in self._embedded_iter_sqlite_database_files(instance_dir):
+                        archive.writestr(
+                            f"db/{file_path.relative_to(instance_dir).as_posix()}",
+                            file_path.read_bytes(),
+                        )
+                else:
+                    pg = info.get("postgres") if isinstance(info.get("postgres"), dict) else {}
+                    env = dict(os.environ)
+                    env["PGPASSWORD"] = str(pg.get("pg_password") or "")
+                    cmd = [
+                        "pg_dump",
+                        "--no-owner",
+                        "--no-privileges",
+                        "-h",
+                        str(pg.get("pg_host") or "127.0.0.1"),
+                        "-p",
+                        str(pg.get("pg_port") or 5432),
+                        "-U",
+                        str(pg.get("pg_username") or slug_norm),
+                        "-d",
+                        str(pg.get("pg_database") or slug_norm),
+                    ]
+                    proc = subprocess.run(cmd, capture_output=True, env=env, check=False, timeout=120)
+                    if proc.returncode != 0:
+                        tail = ((proc.stdout or b"") + b"\n" + (proc.stderr or b"")).decode("utf-8", errors="ignore").strip()[-1500:]
+                        return False, {}, tail or f"pg_dump exited with code {proc.returncode}"
+                    archive.writestr("db/dump.sql", proc.stdout or b"")
+                data_dir = instance_dir / "data"
+                if data_dir.exists():
+                    for file_path in data_dir.rglob("*"):
+                        if file_path.is_file():
+                            archive.writestr(
+                                f"data/{file_path.relative_to(data_dir).as_posix()}",
+                                file_path.read_bytes(),
+                            )
+        except Exception as exc:
+            return False, {}, str(exc)
+        content = buf.getvalue()
+        return True, {
+            "slug": slug_norm,
+            "db_mode": db_mode,
+            "name": f"{slug_norm}-full-snapshot.zip",
+            "media_type": "application/zip",
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "size": len(content),
+        }, None
+
+    def _embedded_upload_instance_full_snapshot(
+        self,
+        slug: str,
+        *,
+        filename: str,
+        content_base64: str,
+    ) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            return False, {"status_code": 400}, "slug is required"
+        try:
+            content = base64.b64decode(str(content_base64 or "").encode("ascii"), validate=True)
+        except Exception:
+            return False, {"status_code": 400}, "content_base64 must be valid base64"
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(content), "r")
+        except Exception as exc:
+            return False, {"status_code": 400}, f"invalid snapshot archive: {exc}"
+        with archive:
+            try:
+                meta = json.loads(archive.read("meta.json").decode("utf-8"))
+            except Exception as exc:
+                return False, {"status_code": 400}, f"archive is missing or has invalid meta.json: {exc}"
+            db_mode = str(meta.get("db_mode") or "sqlite").strip().lower()
+            try:
+                cfg_path = self._embedded_instance_config_path(slug_norm)
+            except ValueError:
+                _, _, wd_root = self._embedded_watchdog_layout(slug_norm)
+                cfg_path = wd_root / "instances" / slug_norm / "config.toml"
+            instance_dir = cfg_path.parent
+            wd_fs_user = _env("SS14_WD_FS_USER") or _env("SS14_WD_USER") or "ss14"
+            wd_fs_group = _env("SS14_WD_FS_GROUP") or _env("SS14_WD_GROUP") or wd_fs_user
+            restored_config: list[str] = []
+            restored_db: list[str] = []
+            restored_data: list[str] = []
+            dump_bytes: bytes | None = None
+            for member in archive.infolist():
+                name = str(member.filename or "").strip()
+                if not name or member.is_dir():
+                    continue
+                if name == "config.toml":
+                    try:
+                        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+                        cfg_path.write_bytes(archive.read(member))
+                        self._embedded_fix_ownership(cfg_path.parent, wd_fs_user, wd_fs_group, recursive=False)
+                        self._embedded_fix_ownership(cfg_path, wd_fs_user, wd_fs_group, recursive=False)
+                        restored_config.append("config.toml")
+                    except Exception as exc:
+                        return False, {}, f"failed to restore config.toml: {exc}"
+                elif name.startswith("db/"):
+                    relative = name[len("db/"):].strip().replace("\\", "/")
+                    parts = [part for part in relative.split("/") if part and part != "."]
+                    if not parts or any(part == ".." for part in parts):
+                        return False, {"status_code": 400}, "archive contains invalid db file path"
+                    if db_mode == "sqlite":
+                        target = instance_dir.joinpath(*parts)
+                        try:
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(archive.read(member))
+                            self._embedded_fix_ownership(target.parent, wd_fs_user, wd_fs_group, recursive=False)
+                            self._embedded_fix_ownership(target, wd_fs_user, wd_fs_group, recursive=False)
+                            restored_db.append(target.relative_to(instance_dir).as_posix())
+                        except Exception as exc:
+                            return False, {}, f"failed to restore db file '{relative}': {exc}"
+                    elif parts == ["dump.sql"]:
+                        dump_bytes = archive.read(member)
+                elif name.startswith("data/"):
+                    relative = name[len("data/"):].strip().replace("\\", "/")
+                    parts = [part for part in relative.split("/") if part and part != "."]
+                    if not parts or any(part == ".." for part in parts):
+                        return False, {"status_code": 400}, "archive contains invalid data file path"
+                    data_dir = instance_dir / "data"
+                    target = data_dir.joinpath(*parts)
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(archive.read(member))
+                        self._embedded_fix_ownership(target.parent, wd_fs_user, wd_fs_group, recursive=False)
+                        self._embedded_fix_ownership(target, wd_fs_user, wd_fs_group, recursive=False)
+                        restored_data.append(target.relative_to(data_dir).as_posix())
+                    except Exception as exc:
+                        return False, {}, f"failed to restore data file '{relative}': {exc}"
+            if db_mode == "postgres" and dump_bytes is not None:
+                ok_db, info_db, error_db = self._embedded_get_instance_database(slug_norm)
+                if not ok_db:
+                    return ok_db, info_db, error_db
+                pg = info_db.get("postgres") if isinstance(info_db.get("postgres"), dict) else {}
+                drop_ok, drop_meta, drop_error = self._embedded_drop_postgres_instance(
+                    dbname=str(pg.get("pg_database") or slug_norm),
+                    username=str(pg.get("pg_username") or slug_norm),
+                )
+                if not drop_ok:
+                    return False, {"drop": drop_meta}, str(drop_error or "failed to drop postgres database")
+                prov_ok, prov_meta, prov_error = self._embedded_postgres_provision(
+                    dbname=str(pg.get("pg_database") or slug_norm),
+                    username=str(pg.get("pg_username") or slug_norm),
+                    password=str(pg.get("pg_password") or ""),
+                )
+                if not prov_ok:
+                    return False, {"provision": prov_meta}, str(prov_error or "failed to provision postgres database")
+                env = dict(os.environ)
+                env["PGPASSWORD"] = str(pg.get("pg_password") or "")
+                cmd = [
+                    "psql",
+                    "-h",
+                    str(pg.get("pg_host") or "127.0.0.1"),
+                    "-p",
+                    str(pg.get("pg_port") or 5432),
+                    "-U",
+                    str(pg.get("pg_username") or slug_norm),
+                    "-d",
+                    str(pg.get("pg_database") or slug_norm),
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                ]
+                proc = subprocess.run(cmd, input=dump_bytes, capture_output=True, env=env, check=False, timeout=180)
+                if proc.returncode != 0:
+                    tail = ((proc.stdout or b"") + b"\n" + (proc.stderr or b"")).decode("utf-8", errors="ignore").strip()[-1500:]
+                    return False, {}, tail or f"psql exited with code {proc.returncode}"
+                restored_db.append("dump.sql")
+        return True, {
+            "slug": slug_norm,
+            "db_mode": db_mode,
+            "restored": {
+                "config": restored_config,
+                "db": restored_db,
+                "data": restored_data,
+            },
+        }, None
+
     def _embedded_delete_instance_data_entry(self, slug: str, path: str) -> tuple[bool, dict[str, Any], str | None]:
         slug_norm = str(slug or "").strip().lower()
         try:
@@ -5536,6 +5735,32 @@ class AgentRuntime:
             return self._embedded_upload_instance_data_file(
                 str(payload.get("slug") or ""),
                 path=str(payload.get("path") or ""),
+                filename=str(payload.get("filename") or ""),
+                content_base64=str(payload.get("content_base64") or ""),
+            )
+        if kind == "download-instance-full-snapshot":
+            ok, result, error = self._embedded_download_instance_full_snapshot(str(payload.get("slug") or ""))
+            if not ok:
+                return ok, result, error
+            transfer_ok, transfer_result, transfer_error = self._upload_download_transfer_chunks(
+                instruction_id=str(item.get("id") or "").strip() or "-",
+                filename=str(result.get("name") or "full-snapshot.zip"),
+                media_type=str(result.get("media_type") or "application/octet-stream"),
+                content=base64.b64decode(str(result.get("content_base64") or "").encode("ascii")),
+            )
+            if not transfer_ok:
+                return False, {"transfer": transfer_result, **dict(result or {})}, transfer_error
+            return True, {
+                "slug": str(result.get("slug") or ""),
+                "db_mode": str(result.get("db_mode") or ""),
+                "name": str(result.get("name") or "full-snapshot.zip"),
+                "media_type": str(result.get("media_type") or "application/octet-stream"),
+                "size": int(result.get("size") or 0),
+                "transfer_id": str(transfer_result.get("transfer_id") or ""),
+            }, None
+        if kind == "upload-instance-full-snapshot":
+            return self._embedded_upload_instance_full_snapshot(
+                str(payload.get("slug") or ""),
                 filename=str(payload.get("filename") or ""),
                 content_base64=str(payload.get("content_base64") or ""),
             )
