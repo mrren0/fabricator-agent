@@ -336,6 +336,64 @@ def test_execute_instruction_restart_includes_gentle_wait_metadata():
     restart_mock.assert_called_once()
 
 
+def test_execute_instruction_update_gentle_does_not_wait_for_players():
+    runtime = _runtime()
+
+    with patch.object(
+        runtime,
+        "_wait_for_instance_empty_if_needed",
+        side_effect=AssertionError("update-instance should let Watchdog handle gentle mode"),
+    ) as wait_mock:
+        with patch.object(
+            runtime,
+            "_execute_watchdog_http_action",
+            return_value=(True, {"status_code": 200}, None),
+        ) as update_mock:
+            with patch.object(runtime, "_execute_watchdog_service_restart") as restart_mock:
+                ok, result, error = runtime._execute_instruction(
+                    {
+                        "id": "inst-u1",
+                        "kind": "update-instance",
+                        "payload": {"slug": "srv-1", "schedule_mode": "gentle"},
+                    }
+                )
+
+    assert ok is True
+    assert error is None
+    assert result["status_code"] == 200
+    wait_mock.assert_not_called()
+    update_mock.assert_called_once()
+    restart_mock.assert_not_called()
+
+
+def test_execute_instruction_update_force_restarts_after_watchdog_update():
+    runtime = _runtime()
+
+    with patch.object(
+        runtime,
+        "_execute_watchdog_http_action",
+        return_value=(True, {"status_code": 200}, None),
+    ) as update_mock:
+        with patch.object(
+            runtime,
+            "_execute_watchdog_service_restart",
+            return_value=(True, {"service": "SS14.Watchdog-srv-1"}, None),
+        ) as restart_mock:
+            ok, result, error = runtime._execute_instruction(
+                {
+                    "id": "inst-u2",
+                    "kind": "update-instance",
+                    "payload": {"slug": "srv-1", "schedule_mode": "force"},
+                }
+            )
+
+    assert ok is True
+    assert error is None
+    assert result["forced_restart"]["service"] == "SS14.Watchdog-srv-1"
+    update_mock.assert_called_once()
+    restart_mock.assert_called_once()
+
+
 def test_database_values_ignore_commented_postgres_lines():
     runtime = _runtime()
 

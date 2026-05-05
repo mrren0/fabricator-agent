@@ -5809,14 +5809,16 @@ class AgentRuntime:
         if kind in {"restart-instance", "update-instance", "stop-instance"}:
             instruction_id = str(item.get("id") or "").strip() or "-"
             slug = str(payload.get("slug") or "").strip()
-            wait_ok, wait_meta, wait_error = self._wait_for_instance_empty_if_needed(
-                instruction_id=instruction_id,
-                kind=kind,
-                slug=slug,
-                payload=payload if isinstance(payload, dict) else None,
-            )
-            if not wait_ok:
-                return False, dict(wait_meta or {}), wait_error
+            wait_meta = None
+            if kind != "update-instance":
+                wait_ok, wait_meta, wait_error = self._wait_for_instance_empty_if_needed(
+                    instruction_id=instruction_id,
+                    kind=kind,
+                    slug=slug,
+                    payload=payload if isinstance(payload, dict) else None,
+                )
+                if not wait_ok:
+                    return False, dict(wait_meta or {}), wait_error
             if kind == "restart-instance":
                 ok, result, error = self._execute_watchdog_service_restart(
                     instruction_id=instruction_id,
@@ -5831,7 +5833,8 @@ class AgentRuntime:
                     action="update",
                 )
                 runtime_info = (result or {}).get("runtime") if isinstance(result, dict) else None
-                if ok and isinstance(runtime_info, dict) and bool(runtime_info.get("installed")):
+                mode = self._instruction_schedule_mode(payload if isinstance(payload, dict) else None)
+                if ok and (mode == "force" or (isinstance(runtime_info, dict) and bool(runtime_info.get("installed")))):
                     restart_ok, restart_result, restart_error = self._execute_watchdog_service_restart(
                         instruction_id=instruction_id,
                         kind="restart-instance",
@@ -5839,13 +5842,11 @@ class AgentRuntime:
                     )
                     if not restart_ok:
                         merged = dict(result or {})
-                        merged["runtime_restart_error"] = restart_error
-                        merged["runtime_restart_result"] = restart_result
-                        return False, merged, f"watchdog update succeeded and .NET runtime was installed, but restart failed: {restart_error}"
+                        merged["restart_error"] = restart_error
+                        merged["restart_result"] = restart_result
+                        return False, merged, f"watchdog update succeeded, but forced restart failed: {restart_error}"
                     merged = dict(result or {})
-                    merged["runtime_restart"] = restart_result
-                    if wait_meta:
-                        merged["schedule_wait"] = wait_meta
+                    merged["forced_restart"] = restart_result
                     return True, merged, None
             else:
                 ok, result, error = self._execute_watchdog_http_action(
@@ -5924,6 +5925,8 @@ class AgentRuntime:
             kwargs: dict[str, Any] = {"headers": headers, "timeout": self.timeout}
             if kind == "create-instance":
                 kwargs["json"] = payload.get("body") or {}
+            elif kind in {"update-instance", "restart-instance"}:
+                kwargs["json"] = {"mode": self._instruction_schedule_mode(payload if isinstance(payload, dict) else None)}
             elif kind == "set-instance-update-policy":
                 kwargs["json"] = {
                     "update_mode": str(payload.get("update_mode") or "").strip(),
