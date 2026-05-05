@@ -4866,6 +4866,8 @@ class AgentRuntime:
         slug = str(body.get("slug") or "").strip().lower()
         repo = str(body.get("repo") or "").strip()
         branch = str(body.get("branch") or "master").strip() or "master"
+        update_mode = "cdn" if str(body.get("update_mode") or "git").strip().lower() == "cdn" else "git"
+        manifest_url = str(body.get("manifest_url") or "").strip() or None
         public_host = _normalize_host(str(body.get("public_host") or _env("SS14_PUBLIC_HOST", "ss-14.ru") or "ss-14.ru"))
         host_user = str(body.get("host_user") or "Ren0san").strip() or "Ren0san"
 
@@ -4969,17 +4971,14 @@ class AgentRuntime:
             f"loginlocal = true\n"
             f"login_host_user = \"{host_user}\"\n"
         )
-        yaml_content = (
-            f"    {slug}:\n"
-            f"      Name: \"{slug}\"\n"
-            f"      ApiToken: \"{api_token}\"\n"
-            f"      ApiPort: {port}\n"
-            f"      ConfigFileName: \"config.toml\"\n"
-            f"      UpdateType: \"Git\"\n"
-            f"      Updates:\n"
-            f"        BaseUrl: \"{repo}\"\n"
-            f"        Branch: \"{branch}\"\n"
-            f"      TimeoutSeconds: 120\n"
+        yaml_content = self._embedded_render_update_policy_fragment(
+            slug=slug,
+            api_token=api_token,
+            api_port=port,
+            repo=repo,
+            branch=branch,
+            update_mode=update_mode,
+            manifest_url=manifest_url,
         )
 
         created_inst_dir = False
@@ -5032,6 +5031,8 @@ class AgentRuntime:
                 "port": port,
                 "repo": repo,
                 "branch": branch,
+                "update_mode": update_mode,
+                "manifest_url": manifest_url,
                 "dir_path": str(inst_dir),
                 "fragment_path": str(frag_file),
                 "token": api_token,
@@ -5075,6 +5076,8 @@ class AgentRuntime:
             env["FABRICATOR_WATCHDOG_PORT"] = str(int((body or {}).get("watchdog_port") or 0))
             env["FABRICATOR_PUBLIC_HOST"] = str((body or {}).get("public_host") or "")
             env["FABRICATOR_HOST_USER"] = str((body or {}).get("host_user") or "")
+            env["FABRICATOR_UPDATE_MODE"] = str((body or {}).get("update_mode") or "git")
+            env["FABRICATOR_MANIFEST_URL"] = str((body or {}).get("manifest_url") or "")
             try:
                 proc = subprocess.run(
                     ["/bin/sh", "-lc", command],
@@ -5096,6 +5099,19 @@ class AgentRuntime:
                     validated = self._validate_create_slug_command_result(body or {}, result)
                 except Exception as exc:
                     return False, result, str(exc)
+                update_mode = str((body or {}).get("update_mode") or "").strip().lower()
+                if update_mode in {"git", "cdn"}:
+                    policy_ok, policy_data, policy_error = self._embedded_set_instance_update_policy(
+                        slug,
+                        update_mode,
+                        str((body or {}).get("manifest_url") or "").strip() or None,
+                        str((body or {}).get("repo") or "").strip() or None,
+                        str((body or {}).get("branch") or "").strip() or None,
+                    )
+                    if policy_ok:
+                        validated["update_policy"] = policy_data
+                    else:
+                        validated["update_policy_warning"] = policy_error or "update policy apply failed"
                 return True, validated, None
             return False, result, f"create-slug command failed with code {proc.returncode}"
 
@@ -5124,6 +5140,21 @@ class AgentRuntime:
             except Exception:
                 data = {"raw": (res.text or "")[-3000:]}
             if ok:
+                update_mode = str((body or {}).get("update_mode") or "").strip().lower()
+                if update_mode in {"git", "cdn"}:
+                    policy_ok, policy_data, policy_error = self._embedded_set_instance_update_policy(
+                        slug,
+                        update_mode,
+                        str((body or {}).get("manifest_url") or "").strip() or None,
+                        str((body or {}).get("repo") or "").strip() or None,
+                        str((body or {}).get("branch") or "").strip() or None,
+                    )
+                    if not policy_ok:
+                        data = dict(data or {})
+                        data["update_policy_warning"] = policy_error or "update policy apply failed"
+                    else:
+                        data = dict(data or {})
+                        data["update_policy"] = policy_data
                 return True, {"status_code": res.status_code, "response": data, "fallback": "create-instance"}, None
             should_fallback_embedded = res.status_code >= 500 or res.status_code in {404, 405}
             if not should_fallback_embedded or not embedded_enabled:

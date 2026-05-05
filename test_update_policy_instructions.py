@@ -453,3 +453,20 @@ def test_instance_database_backup_roundtrip_sqlite():
     assert ok_restore is True
     assert restore_error is None
     assert restore_result["restored"] is True
+
+
+def test_embedded_create_slug_renders_cdn_update_policy_from_payload():
+    runtime = _runtime()
+    fragment = runtime._embedded_render_update_policy_fragment(
+        slug="srv-new",
+        api_token="token-1",
+        api_port=1212,
+        repo="https://github.com/org/repo",
+        branch="master",
+        update_mode="cdn",
+        manifest_url="https://cdn.example/srv-new/manifest",
+    )
+
+    assert 'UpdateType: "Manifest"' in fragment
+    assert 'ManifestUrl: "https://cdn.example/srv-new/manifest"' in fragment
+    assert 'BaseUrl: "https://github.com/org/repo"' not in fragment
