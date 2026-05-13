@@ -5513,6 +5513,25 @@ class AgentRuntime:
                 )
             time.sleep(min(poll_seconds, max(0.2, deadline - time.time())))
 
+    def _wait_for_instance_inactive(
+        self,
+        *,
+        slug: str,
+        timeout_seconds: float = 8.0,
+        poll_seconds: float = 0.6,
+    ) -> tuple[bool, dict[str, Any]]:
+        slug_norm = str(slug or "").strip().lower()
+        deadline = time.time() + max(1.0, float(timeout_seconds))
+        last_snapshot: dict[str, Any] = {}
+        while True:
+            snapshot = self._embedded_instance_status_snapshot(slug_norm)
+            last_snapshot = snapshot if isinstance(snapshot, dict) else {}
+            if not bool(last_snapshot.get("active")):
+                return True, last_snapshot
+            if time.time() >= deadline:
+                return False, last_snapshot
+            time.sleep(max(0.2, float(poll_seconds)))
+
     def _execute_watchdog_service_restart(
         self,
         *,
@@ -5826,20 +5845,20 @@ class AgentRuntime:
             instruction_id = str(item.get("id") or "").strip() or "-"
             slug = str(payload.get("slug") or "").strip()
             wait_meta = None
-            if kind != "update-instance":
-                wait_ok, wait_meta, wait_error = self._wait_for_instance_empty_if_needed(
-                    instruction_id=instruction_id,
-                    kind=kind,
-                    slug=slug,
-                    payload=payload if isinstance(payload, dict) else None,
-                )
-                if not wait_ok:
-                    return False, dict(wait_meta or {}), wait_error
+            wait_ok, wait_meta, wait_error = self._wait_for_instance_empty_if_needed(
+                instruction_id=instruction_id,
+                kind=kind,
+                slug=slug,
+                payload=payload if isinstance(payload, dict) else None,
+            )
+            if not wait_ok:
+                return False, dict(wait_meta or {}), wait_error
             if kind == "restart-instance":
-                ok, result, error = self._execute_watchdog_service_restart(
+                ok, result, error = self._execute_watchdog_http_action(
                     instruction_id=instruction_id,
                     kind=kind,
                     slug=slug,
+                    action="restart",
                 )
             elif kind == "update-instance":
                 ok, result, error = self._execute_watchdog_http_action(
@@ -5851,10 +5870,20 @@ class AgentRuntime:
                 runtime_info = (result or {}).get("runtime") if isinstance(result, dict) else None
                 mode = self._instruction_schedule_mode(payload if isinstance(payload, dict) else None)
                 if ok and (mode == "force" or (isinstance(runtime_info, dict) and bool(runtime_info.get("installed")))):
-                    restart_ok, restart_result, restart_error = self._execute_watchdog_service_restart(
+                    try:
+                        restart_delay = max(
+                            0.0,
+                            float(_env("AGENT_WATCHDOG_FORCE_UPDATE_RESTART_DELAY_SECONDS", "3") or "3"),
+                        )
+                    except Exception:
+                        restart_delay = 3.0
+                    if restart_delay > 0:
+                        time.sleep(restart_delay)
+                    restart_ok, restart_result, restart_error = self._execute_watchdog_http_action(
                         instruction_id=instruction_id,
                         kind="restart-instance",
                         slug=slug,
+                        action="restart",
                     )
                     if not restart_ok:
                         merged = dict(result or {})
@@ -5866,28 +5895,50 @@ class AgentRuntime:
                     return True, merged, None
             else:
                 mode = self._instruction_schedule_mode(payload if isinstance(payload, dict) else None)
-                if mode == "force":
-                    ok, result, error = self._execute_watchdog_service_stop(
-                        instruction_id=instruction_id,
-                        kind=kind,
-                        slug=slug,
-                    )
-                    if ok and isinstance(result, dict):
+                ok, result, error = self._execute_watchdog_http_action(
+                    instruction_id=instruction_id,
+                    kind=kind,
+                    slug=slug,
+                    action="stop",
+                    reason=str(payload.get("reason") or "").strip() or None,
+                )
+                if ok:
+                    inactive_ok, inactive_snapshot = self._wait_for_instance_inactive(slug=slug)
+                    if isinstance(result, dict):
                         result = dict(result or {})
                         result["mode"] = mode
-                else:
-                    ok, result, error = self._execute_watchdog_http_action(
-                        instruction_id=instruction_id,
-                        kind=kind,
-                        slug=slug,
-                        action="stop",
-                        reason=str(payload.get("reason") or "").strip() or None,
-                    )
+                    if not inactive_ok:
+                        error = "watchdog stop returned success, but instance is still active"
+                        if isinstance(result, dict):
+                            result["active_after_stop"] = inactive_snapshot
+                        ok = False
             if ok:
                 if wait_meta and isinstance(result, dict):
                     result = dict(result or {})
                     result["schedule_wait"] = wait_meta
                 return True, result, None
+            if kind == "restart-instance" and _env_bool("AGENT_WATCHDOG_RESTART_SYSTEMCTL_FALLBACK", True):
+                restart_ok, restart_result, restart_error = self._execute_watchdog_service_restart(
+                    instruction_id=instruction_id,
+                    kind=kind,
+                    slug=slug,
+                )
+                if restart_ok:
+                    merged = dict(restart_result or {})
+                    merged["fallback"] = "systemctl-restart"
+                    merged["watchdog_http_error"] = error
+                    merged["watchdog_http_result"] = result
+                    if wait_meta:
+                        merged["schedule_wait"] = wait_meta
+                    return True, merged, None
+                logger.warning(
+                    "Instruction id=%s kind=%s slug=%s direct watchdog restart failed; systemctl restart fallback also failed: %s result=%s",
+                    instruction_id,
+                    kind,
+                    slug or "-",
+                    str(restart_error or "-"),
+                    _log_tail(restart_result or {}),
+                )
             if kind == "stop-instance" and _env_bool("AGENT_WATCHDOG_STOP_SYSTEMCTL_FALLBACK", True):
                 stop_ok, stop_result, stop_error = self._execute_watchdog_service_stop(
                     instruction_id=instruction_id,

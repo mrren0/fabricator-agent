@@ -73,17 +73,17 @@ def test_resolve_watchdog_api_base_url_uses_local_default_for_embedded_instance(
     assert source.endswith("config.toml")
 
 
-def test_execute_instruction_force_stop_uses_systemctl_stop_before_watchdog_http():
+def test_execute_instruction_force_stop_uses_watchdog_http_then_verifies_inactive():
     runtime = _runtime()
     with patch.object(
         runtime,
         "_execute_watchdog_http_action",
-        side_effect=AssertionError("force stop must not use Watchdog HTTP stop"),
-    ), patch.object(
+        return_value=(True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/fallout/stop"}, None),
+    ) as stop_http_mock, patch.object(
         runtime,
-        "_execute_watchdog_service_stop",
-        return_value=(True, {"status_code": 200, "service": "SS14.Watchdog-fallout"}, None),
-    ) as stop_mock:
+        "_wait_for_instance_inactive",
+        return_value=(True, {"active": False, "status": "offline"}),
+    ) as inactive_mock:
         ok, result, error = runtime._execute_instruction(
             {
                 "id": "inst-force-stop",
@@ -94,8 +94,42 @@ def test_execute_instruction_force_stop_uses_systemctl_stop_before_watchdog_http
 
     assert ok is True
     assert error is None
-    assert result["service"] == "SS14.Watchdog-fallout"
+    assert result["status_code"] == 200
     assert result["mode"] == "force"
+    stop_http_mock.assert_called_once()
+    inactive_mock.assert_called_once_with(slug="fallout")
+
+
+def test_execute_instruction_force_stop_falls_back_to_systemctl_when_watchdog_stop_keeps_server_active():
+    runtime = _runtime()
+    with patch.object(
+        runtime,
+        "_execute_watchdog_http_action",
+        return_value=(True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/fallout/stop"}, None),
+    ) as stop_http_mock, patch.object(
+        runtime,
+        "_wait_for_instance_inactive",
+        return_value=(False, {"active": True, "players": 1}),
+    ) as inactive_mock, patch.object(
+        runtime,
+        "_execute_watchdog_service_stop",
+        return_value=(True, {"status_code": 200, "service": "SS14.Watchdog-fallout"}, None),
+    ) as stop_mock:
+        ok, result, error = runtime._execute_instruction(
+            {
+                "id": "inst-force-stop-fallback",
+                "kind": "stop-instance",
+                "payload": {"slug": "fallout", "schedule_mode": "force"},
+            }
+        )
+
+    assert ok is True
+    assert error is None
+    assert result["fallback"] == "systemctl-stop"
+    assert result["service"] == "SS14.Watchdog-fallout"
+    assert result["watchdog_http_error"] == "watchdog stop returned success, but instance is still active"
+    stop_http_mock.assert_called_once()
+    inactive_mock.assert_called_once_with(slug="fallout")
     stop_mock.assert_called_once()
 
 
@@ -380,8 +414,8 @@ def test_execute_instruction_restart_includes_gentle_wait_metadata():
     ) as wait_mock:
         with patch.object(
             runtime,
-            "_execute_watchdog_service_restart",
-            return_value=(True, {"status_code": 200, "service": "SS14.Watchdog-srv-1"}, None),
+            "_execute_watchdog_http_action",
+            return_value=(True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/restart"}, None),
         ) as restart_mock:
             ok, result, error = runtime._execute_instruction(
                 {
@@ -398,13 +432,13 @@ def test_execute_instruction_restart_includes_gentle_wait_metadata():
     restart_mock.assert_called_once()
 
 
-def test_execute_instruction_update_gentle_does_not_wait_for_players():
+def test_execute_instruction_update_gentle_waits_for_players_before_watchdog_update():
     runtime = _runtime()
 
     with patch.object(
         runtime,
         "_wait_for_instance_empty_if_needed",
-        side_effect=AssertionError("update-instance should let Watchdog handle gentle mode"),
+        return_value=(True, {"mode": "gentle", "players": 0, "waited_seconds": 0.0}, None),
     ) as wait_mock:
         with patch.object(
             runtime,
@@ -423,7 +457,8 @@ def test_execute_instruction_update_gentle_does_not_wait_for_players():
     assert ok is True
     assert error is None
     assert result["status_code"] == 200
-    wait_mock.assert_not_called()
+    assert result["schedule_wait"]["mode"] == "gentle"
+    wait_mock.assert_called_once()
     update_mock.assert_called_once()
     restart_mock.assert_not_called()
 
@@ -433,14 +468,16 @@ def test_execute_instruction_update_force_restarts_after_watchdog_update():
 
     with patch.object(
         runtime,
+        "_wait_for_instance_empty_if_needed",
+        return_value=(True, None, None),
+    ) as wait_mock, patch.object(
+        runtime,
         "_execute_watchdog_http_action",
-        return_value=(True, {"status_code": 200}, None),
-    ) as update_mock:
-        with patch.object(
-            runtime,
-            "_execute_watchdog_service_restart",
-            return_value=(True, {"service": "SS14.Watchdog-srv-1"}, None),
-        ) as restart_mock:
+        side_effect=[
+            (True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/update"}, None),
+            (True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/restart"}, None),
+        ],
+    ) as update_mock, patch.object(agent_main.time, "sleep", return_value=None) as sleep_mock:
             ok, result, error = runtime._execute_instruction(
                 {
                     "id": "inst-u2",
@@ -451,9 +488,11 @@ def test_execute_instruction_update_force_restarts_after_watchdog_update():
 
     assert ok is True
     assert error is None
-    assert result["forced_restart"]["service"] == "SS14.Watchdog-srv-1"
-    update_mock.assert_called_once()
-    restart_mock.assert_called_once()
+    assert result["forced_restart"]["status_code"] == 200
+    assert result["forced_restart"]["url"].endswith("/instances/srv-1/restart")
+    wait_mock.assert_called_once()
+    assert update_mock.call_count == 2
+    sleep_mock.assert_called_once()
 
 
 def test_database_values_ignore_commented_postgres_lines():
