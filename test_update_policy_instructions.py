@@ -37,6 +37,42 @@ def test_supported_instruction_kinds_include_update_policy():
     assert "upload-instance-data-file" in kinds
 
 
+def test_resolve_watchdog_api_base_url_uses_local_default_for_embedded_instance():
+    runtime = _runtime()
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        wd_root = root / "watchdog-fallout"
+        cfg = wd_root / "instances" / "fallout" / "config.toml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text('[watchdog]\ntoken = "token-1"\n', encoding="utf-8")
+        old = {
+            k: agent_main.os.environ.get(k)
+            for k in (
+                "SS14_WD_ROOT",
+                "SS14_WD_DEDICATED_BASE",
+                "AGENT_WATCHDOG_API_URL",
+                "AGENT_WATCHDOG_DEFAULT_API_URL",
+                "AGENT_WATCHDOG_LOCAL_API_URL",
+            )
+        }
+        agent_main.os.environ["SS14_WD_ROOT"] = str(root / "watchdog")
+        agent_main.os.environ["SS14_WD_DEDICATED_BASE"] = str(root)
+        for key in ("AGENT_WATCHDOG_API_URL", "AGENT_WATCHDOG_DEFAULT_API_URL", "AGENT_WATCHDOG_LOCAL_API_URL"):
+            agent_main.os.environ.pop(key, None)
+        try:
+            base_url, source = runtime._resolve_watchdog_api_base_url("fallout")
+        finally:
+            for key, value in old.items():
+                if value is None:
+                    agent_main.os.environ.pop(key, None)
+                else:
+                    agent_main.os.environ[key] = value
+
+    assert base_url == "http://127.0.0.1:8000"
+    assert source.startswith("default-local-watchdog:")
+    assert source.endswith("config.toml")
+
+
 def test_execute_instruction_get_instance_update_policy_uses_embedded_fragment():
     runtime = _runtime()
     with tempfile.TemporaryDirectory() as td:

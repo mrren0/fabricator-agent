@@ -5226,6 +5226,22 @@ class AgentRuntime:
             parsed = urlparse(env_url if "://" in env_url else f"http://{env_url}")
             if parsed.scheme and parsed.netloc:
                 return f"{parsed.scheme}://{parsed.netloc}".rstrip("/"), "AGENT_WATCHDOG_API_URL"
+        try:
+            cfg_path = self._embedded_instance_config_path(slug_norm)
+        except Exception:
+            cfg_path = None
+        if cfg_path and cfg_path.is_file():
+            fallback_url = str(
+                _env("AGENT_WATCHDOG_DEFAULT_API_URL")
+                or _env("AGENT_WATCHDOG_LOCAL_API_URL")
+                or DEFAULT_LOCAL_EDGE_URL
+            ).strip()
+            parsed = urlparse(fallback_url if "://" in fallback_url else f"http://{fallback_url}")
+            if parsed.scheme and parsed.netloc:
+                return (
+                    f"{parsed.scheme}://{parsed.netloc}".rstrip("/"),
+                    f"default-local-watchdog:{cfg_path}",
+                )
         return "", "not-found"
 
     def _resolve_watchdog_instance_token(self, slug: str) -> tuple[str, str]:
