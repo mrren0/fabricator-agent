@@ -73,6 +73,32 @@ def test_resolve_watchdog_api_base_url_uses_local_default_for_embedded_instance(
     assert source.endswith("config.toml")
 
 
+def test_execute_instruction_force_stop_uses_systemctl_stop_before_watchdog_http():
+    runtime = _runtime()
+    with patch.object(
+        runtime,
+        "_execute_watchdog_http_action",
+        side_effect=AssertionError("force stop must not use Watchdog HTTP stop"),
+    ), patch.object(
+        runtime,
+        "_execute_watchdog_service_stop",
+        return_value=(True, {"status_code": 200, "service": "SS14.Watchdog-fallout"}, None),
+    ) as stop_mock:
+        ok, result, error = runtime._execute_instruction(
+            {
+                "id": "inst-force-stop",
+                "kind": "stop-instance",
+                "payload": {"slug": "fallout", "schedule_mode": "force"},
+            }
+        )
+
+    assert ok is True
+    assert error is None
+    assert result["service"] == "SS14.Watchdog-fallout"
+    assert result["mode"] == "force"
+    stop_mock.assert_called_once()
+
+
 def test_execute_instruction_get_instance_update_policy_uses_embedded_fragment():
     runtime = _runtime()
     with tempfile.TemporaryDirectory() as td:

@@ -5865,13 +5865,24 @@ class AgentRuntime:
                     merged["forced_restart"] = restart_result
                     return True, merged, None
             else:
-                ok, result, error = self._execute_watchdog_http_action(
-                    instruction_id=instruction_id,
-                    kind=kind,
-                    slug=slug,
-                    action="stop",
-                    reason=str(payload.get("reason") or "").strip() or None,
-                )
+                mode = self._instruction_schedule_mode(payload if isinstance(payload, dict) else None)
+                if mode == "force":
+                    ok, result, error = self._execute_watchdog_service_stop(
+                        instruction_id=instruction_id,
+                        kind=kind,
+                        slug=slug,
+                    )
+                    if ok and isinstance(result, dict):
+                        result = dict(result or {})
+                        result["mode"] = mode
+                else:
+                    ok, result, error = self._execute_watchdog_http_action(
+                        instruction_id=instruction_id,
+                        kind=kind,
+                        slug=slug,
+                        action="stop",
+                        reason=str(payload.get("reason") or "").strip() or None,
+                    )
             if ok:
                 if wait_meta and isinstance(result, dict):
                     result = dict(result or {})
