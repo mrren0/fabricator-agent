@@ -20,6 +20,7 @@ import re
 import secrets
 import shlex
 import shutil
+import sqlite3
 import socket
 import subprocess
 import threading
@@ -639,6 +640,10 @@ class AgentRuntime:
             "delete-instance-data-entry",
             "download-instance-full-snapshot",
             "upload-instance-full-snapshot",
+            "get-instance-whitelist",
+            "set-instance-whitelist-enabled",
+            "add-instance-whitelist-player",
+            "remove-instance-whitelist-player",
         ]
 
     def _resolve_agent_id(self) -> str:
@@ -2407,7 +2412,62 @@ class AgentRuntime:
             return dedicated_cfg
         if legacy_cfg.exists():
             return legacy_cfg
+        scanned_cfg = self._embedded_scan_instance_config_path(slug_norm)
+        if scanned_cfg is not None:
+            return scanned_cfg
         raise ValueError(f"config.toml for '{slug_norm}' does not exist")
+
+    def _embedded_scan_instance_config_path(self, slug: str) -> Path | None:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            return None
+        roots: list[Path] = []
+        for raw in (
+            _env("SS14_WD_DEDICATED_BASE", ""),
+            "/opt/ss14",
+            "/opt/valtos/ss14",
+            "/watchdog",
+        ):
+            text = str(raw or "").strip()
+            if text:
+                roots.append(Path(text))
+
+        candidates: list[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            if not root.exists():
+                continue
+            patterns = (
+                f"watchdog-{slug_norm}/instances/{slug_norm}/config.toml",
+                f"watchdog-{slug_norm}*/instances/*/config.toml",
+                f"watchdog-*/instances/{slug_norm}/config.toml",
+                f"watchdog-*/instances/*{slug_norm}*/config.toml",
+                f"**/instances/{slug_norm}/config.toml",
+                f"**/instances/*{slug_norm}*/config.toml",
+            )
+            for pattern in patterns:
+                try:
+                    found = sorted(root.glob(pattern))
+                except Exception:
+                    found = []
+                for item in found:
+                    key = str(item)
+                    if item.is_file() and key not in seen:
+                        candidates.append(item)
+                        seen.add(key)
+
+        def score(path: Path) -> tuple[int, int, str]:
+            text = str(path).lower()
+            instance_name = path.parent.name.lower()
+            watchdog_name = path.parents[2].name.lower() if len(path.parents) > 2 else ""
+            exact_instance = 0 if instance_name == slug_norm else 1
+            exact_watchdog = 0 if watchdog_name == f"watchdog-{slug_norm}" else 1
+            contains = 0 if slug_norm in text else 1
+            return (exact_instance + exact_watchdog + contains, len(text), text)
+
+        if not candidates:
+            return None
+        return sorted(candidates, key=score)[0]
 
     def _embedded_config_contains_slug(self, slug: str, content: str) -> bool:
         slug_norm = str(slug or "").strip().lower()
@@ -3085,6 +3145,248 @@ class AgentRuntime:
         payload["config_path"] = str(cfg_path)
         payload["content_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
         return True, payload, None
+
+    def _embedded_get_whitelist_enabled_from_config(self, content: str) -> bool:
+        try:
+            parsed = tomllib.loads(content)
+            section = parsed.get("whitelist") if isinstance(parsed, dict) else {}
+            if isinstance(section, dict) and "enabled" in section:
+                return bool(section.get("enabled"))
+        except Exception:
+            pass
+        match = re.search(r"(?ims)^\s*\[whitelist\]\s*(.*?)(?=^\s*\[|\Z)", content)
+        if not match:
+            return False
+        enabled = re.search(r"(?im)^\s*enabled\s*=\s*(true|false)\s*$", match.group(1))
+        return bool(enabled and enabled.group(1).lower() == "true")
+
+    def _embedded_set_whitelist_enabled_in_config(self, content: str, enabled: bool) -> str:
+        value = "true" if enabled else "false"
+        match = re.search(r"(?ims)^\s*\[whitelist\]\s*(.*?)(?=^\s*\[|\Z)", content)
+        if not match:
+            suffix = "\n" if content.endswith("\n") else "\n\n"
+            return f"{content}{suffix}[whitelist]\nenabled = {value}\n"
+        block = match.group(0)
+        if re.search(r"(?im)^\s*enabled\s*=", block):
+            next_block = re.sub(r"(?im)^(\s*enabled\s*=\s*)(true|false).*$", rf"\g<1>{value}", block, count=1)
+        else:
+            next_block = block.rstrip() + f"\nenabled = {value}\n"
+        return content[: match.start()] + next_block + content[match.end():]
+
+    def _embedded_find_sqlite_db_for_instance(self, slug: str) -> Path:
+        cfg_path = self._embedded_instance_config_path(slug)
+        instance_dir = cfg_path.parent
+        candidates = [
+            instance_dir / "data" / "server.db",
+            instance_dir / "data" / f"{slug}.db",
+            instance_dir / f"{slug}.db",
+        ]
+        for root in (instance_dir / "data", instance_dir):
+            try:
+                candidates.extend(sorted(root.glob("*.db")))
+            except Exception:
+                pass
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            try:
+                conn = sqlite3.connect(str(candidate))
+                try:
+                    tables = {str(row[0] or "").lower() for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                finally:
+                    conn.close()
+                if "whitelist" in tables and "player" in tables:
+                    return candidate
+            except Exception:
+                continue
+        raise FileNotFoundError(f"sqlite database with player/whitelist tables was not found for '{slug}'")
+
+    def _embedded_whitelist_auth_server(self, content: str) -> str:
+        try:
+            parsed = tomllib.loads(content or "")
+            section = parsed.get("auth") if isinstance(parsed, dict) else {}
+            if isinstance(section, dict):
+                server = str(section.get("server") or "").strip()
+                if server:
+                    return server.rstrip("/") + "/"
+        except Exception:
+            pass
+        match = re.search(r"(?ims)^\s*\[auth\]\s*(.*?)(?=^\s*\[|\Z)", content or "")
+        if match:
+            server_match = re.search(r"(?im)^\s*server\s*=\s*[\"']?([^\"'\s]+)", match.group(1))
+            if server_match:
+                return str(server_match.group(1) or "").strip().rstrip("/") + "/"
+        return "https://auth.spacestation14.com/"
+
+    def _embedded_normalize_user_id(self, value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            return str(uuid.UUID(text)).upper()
+        except Exception:
+            return text
+
+    def _embedded_lookup_auth_player(self, config_content: str, query: str) -> dict[str, str] | None:
+        query_text = str(query or "").strip()
+        if not query_text:
+            return None
+        auth_server = self._embedded_whitelist_auth_server(config_content)
+        try:
+            parsed_guid = uuid.UUID(query_text)
+            endpoint = f"{auth_server}api/query/userid"
+            params = {"userid": str(parsed_guid)}
+        except Exception:
+            endpoint = f"{auth_server}api/query/name"
+            params = {"name": query_text}
+        try:
+            response = requests.get(endpoint, params=params, timeout=8, headers={"User-Agent": "SpaceStation14/1.0"})
+        except Exception:
+            return None
+        if response.status_code == 404:
+            return None
+        if not response.ok:
+            return None
+        try:
+            data = response.json()
+        except Exception:
+            return None
+        user_id = self._embedded_normalize_user_id(str(data.get("userId") or data.get("user_id") or ""))
+        username = str(data.get("userName") or data.get("user_name") or query_text).strip()
+        if not user_id:
+            return None
+        return {"user_id": user_id, "username": username}
+
+    def _embedded_read_whitelist_players(self, db_path: Path, config_content: str = "") -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT w.user_id AS user_id, p.last_seen_user_name AS username, p.last_seen_time AS last_seen_time
+                FROM whitelist w
+                LEFT JOIN player p ON lower(p.user_id) = lower(w.user_id)
+                ORDER BY lower(COALESCE(p.last_seen_user_name, w.user_id))
+                """
+            ).fetchall()
+            players = [
+                {
+                    "user_id": self._embedded_normalize_user_id(str(row["user_id"] or "")),
+                    "username": str(row["username"] or ""),
+                    "last_seen_time": str(row["last_seen_time"] or ""),
+                }
+                for row in rows
+            ]
+            for item in players:
+                if item.get("username"):
+                    continue
+                resolved = self._embedded_lookup_auth_player(config_content, str(item.get("user_id") or ""))
+                if resolved:
+                    item["username"] = resolved["username"]
+            schema = {
+                "tables": ["player", "whitelist"],
+                "columns": {
+                    "player": [str(row[1]) for row in conn.execute("PRAGMA table_info(player)").fetchall()],
+                    "whitelist": [str(row[1]) for row in conn.execute("PRAGMA table_info(whitelist)").fetchall()],
+                },
+            }
+            return players, schema
+        finally:
+            conn.close()
+
+    def _embedded_get_instance_whitelist(self, slug: str) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        if not slug_norm:
+            return False, {"status_code": 400}, "slug is required"
+        try:
+            cfg_path = self._embedded_instance_config_path(slug_norm)
+            content = cfg_path.read_text(encoding="utf-8", errors="ignore")
+            db_path = self._embedded_find_sqlite_db_for_instance(slug_norm)
+            players, schema = self._embedded_read_whitelist_players(db_path, content)
+        except FileNotFoundError as exc:
+            return False, {"status_code": 404}, str(exc)
+        except ValueError as exc:
+            return False, {"status_code": 404}, str(exc)
+        except Exception as exc:
+            return False, {}, str(exc)
+        return True, {
+            "slug": slug_norm,
+            "enabled": self._embedded_get_whitelist_enabled_from_config(content),
+            "restart_required": False,
+            "players": players,
+            "database_path": str(db_path),
+            "config_path": str(cfg_path),
+            "schema": schema,
+            "commands": {
+                "add": "whitelistadd <username>",
+                "remove": "whitelistremove <username>",
+                "kick_non_whitelisted": "kicknonwhitelisted",
+            },
+        }, None
+
+    def _embedded_set_instance_whitelist_enabled(self, slug: str, enabled: bool) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        try:
+            cfg_path = self._embedded_instance_config_path(slug_norm)
+            content = cfg_path.read_text(encoding="utf-8", errors="ignore")
+            next_content = self._embedded_set_whitelist_enabled_in_config(content, bool(enabled))
+            if next_content != content:
+                cfg_path.with_suffix(".toml.bak").write_text(content, encoding="utf-8")
+                cfg_path.write_text(next_content, encoding="utf-8")
+        except ValueError as exc:
+            return False, {"status_code": 404}, str(exc)
+        except Exception as exc:
+            return False, {}, str(exc)
+        ok, payload, error = self._embedded_get_instance_whitelist(slug_norm)
+        if not ok:
+            payload = {"slug": slug_norm, "enabled": bool(enabled)}
+        payload["updated"] = True
+        payload["restart_required"] = True
+        payload["message"] = "Restart the server to apply."
+        return True, payload, error
+
+    def _embedded_change_instance_whitelist_player(self, slug: str, username: str, *, add: bool) -> tuple[bool, dict[str, Any], str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        name = str(username or "").strip()
+        if not slug_norm:
+            return False, {"status_code": 400}, "slug is required"
+        if not name:
+            return False, {"status_code": 400}, "username is required"
+        try:
+            cfg_path = self._embedded_instance_config_path(slug_norm)
+            content = cfg_path.read_text(encoding="utf-8", errors="ignore")
+            db_path = self._embedded_find_sqlite_db_for_instance(slug_norm)
+            conn = sqlite3.connect(str(db_path), timeout=15)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT user_id, last_seen_user_name FROM player WHERE lower(last_seen_user_name) = lower(?) ORDER BY last_seen_time DESC LIMIT 1",
+                    (name,),
+                ).fetchone()
+                if row is None:
+                    resolved = self._embedded_lookup_auth_player(content, name)
+                    if resolved is None:
+                        return False, {"status_code": 404, "database_path": str(db_path)}, f"player '{name}' was not found in local database or SS14 auth server"
+                    user_id = resolved["user_id"]
+                    resolved_username = resolved["username"]
+                else:
+                    user_id = self._embedded_normalize_user_id(str(row["user_id"] or "").strip())
+                    resolved_username = str(row["last_seen_user_name"] or name).strip() or name
+                if add:
+                    conn.execute("INSERT OR IGNORE INTO whitelist (user_id) VALUES (?)", (user_id,))
+                else:
+                    conn.execute("DELETE FROM whitelist WHERE lower(user_id) = lower(?)", (user_id,))
+                conn.commit()
+            finally:
+                conn.close()
+            ok, payload, error = self._embedded_get_instance_whitelist(slug_norm)
+            if not ok:
+                return ok, payload, error
+            payload["updated"] = True
+            payload["changed_player"] = {"username": resolved_username, "user_id": user_id, "action": "add" if add else "remove"}
+            return True, payload, None
+        except Exception as exc:
+            return False, {}, str(exc)
 
     def _embedded_iter_sqlite_database_files(self, instance_dir: Path) -> list[Path]:
         patterns = (
@@ -5768,6 +6070,25 @@ class AgentRuntime:
             )
         if kind == "reset-instance-postgres":
             return self._embedded_reset_instance_postgres(str(payload.get("slug") or ""))
+        if kind == "get-instance-whitelist":
+            return self._embedded_get_instance_whitelist(str(payload.get("slug") or ""))
+        if kind == "set-instance-whitelist-enabled":
+            return self._embedded_set_instance_whitelist_enabled(
+                str(payload.get("slug") or ""),
+                bool(payload.get("enabled")),
+            )
+        if kind == "add-instance-whitelist-player":
+            return self._embedded_change_instance_whitelist_player(
+                str(payload.get("slug") or ""),
+                str(payload.get("username") or ""),
+                add=True,
+            )
+        if kind == "remove-instance-whitelist-player":
+            return self._embedded_change_instance_whitelist_player(
+                str(payload.get("slug") or ""),
+                str(payload.get("username") or ""),
+                add=False,
+            )
         if kind == "list-instance-data":
             return self._embedded_list_instance_data(
                 str(payload.get("slug") or ""),

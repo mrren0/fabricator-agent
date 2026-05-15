@@ -1,4 +1,5 @@
 import sys
+import sqlite3
 import tempfile
 import types
 from pathlib import Path
@@ -33,6 +34,10 @@ def test_supported_instruction_kinds_include_update_policy():
     assert "upload-instance-database-backup" in kinds
     assert "reset-instance-postgres" in kinds
     assert "list-instance-data" in kinds
+    assert "get-instance-whitelist" in kinds
+    assert "set-instance-whitelist-enabled" in kinds
+    assert "add-instance-whitelist-player" in kinds
+    assert "remove-instance-whitelist-player" in kinds
     assert "download-instance-data-file" in kinds
     assert "upload-instance-data-file" in kinds
 
@@ -629,3 +634,115 @@ def test_embedded_create_slug_renders_cdn_update_policy_from_payload():
     assert 'UpdateType: "Manifest"' in fragment
     assert 'ManifestUrl: "https://cdn.example/srv-new/manifest"' in fragment
     assert 'BaseUrl: "https://github.com/org/repo"' not in fragment
+
+
+def test_instance_whitelist_roundtrip_sqlite_and_config_toggle():
+    runtime = _runtime()
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        slug = "srv-1"
+        wd_root = root / "watchdog-srv-1"
+        inst_dir = wd_root / "instances" / slug
+        data_dir = inst_dir / "data"
+        data_dir.mkdir(parents=True)
+        (inst_dir / "config.toml").write_text('[game]\nhostname = "srv-1"\n[whitelist]\nenabled = false\n', encoding="utf-8")
+        db_path = data_dir / "server.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("CREATE TABLE player (player_id INTEGER PRIMARY KEY, user_id TEXT UNIQUE, last_seen_user_name TEXT, last_seen_time TEXT)")
+            conn.execute("CREATE TABLE whitelist (user_id TEXT PRIMARY KEY)")
+            conn.execute(
+                "INSERT INTO player (user_id, last_seen_user_name, last_seen_time) VALUES (?, ?, ?)",
+                ("00000000-0000-0000-0000-000000000001", "Ren0san", "2026-05-14"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        old = {k: agent_main.os.environ.get(k) for k in ("SS14_WD_ROOT", "SS14_WD_DEDICATED_BASE")}
+        agent_main.os.environ["SS14_WD_ROOT"] = str(root / "watchdog")
+        agent_main.os.environ["SS14_WD_DEDICATED_BASE"] = str(root)
+        try:
+            ok, result, error = runtime._embedded_get_instance_whitelist(slug)
+            assert ok is True, error
+            assert result["enabled"] is False
+            assert result["players"] == []
+
+            ok, result, error = runtime._embedded_change_instance_whitelist_player(slug, "Ren0san", add=True)
+            assert ok is True, error
+            assert result["players"][0]["username"] == "Ren0san"
+
+            ok, result, error = runtime._embedded_set_instance_whitelist_enabled(slug, True)
+            assert ok is True, error
+            assert result["enabled"] is True
+            assert result["restart_required"] is True
+            assert "enabled = true" in (inst_dir / "config.toml").read_text(encoding="utf-8")
+
+            ok, result, error = runtime._embedded_change_instance_whitelist_player(slug, "ren0SAN", add=False)
+            assert ok is True, error
+            assert result["players"] == []
+        finally:
+            for key, value in old.items():
+                if value is None:
+                    agent_main.os.environ.pop(key, None)
+                else:
+                    agent_main.os.environ[key] = value
+
+
+def test_instance_whitelist_resolves_auth_user_and_scans_live_layout_alias():
+    runtime = _runtime()
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        wd_root = root / "watchdog-moonlight-shard"
+        inst_dir = wd_root / "instances" / "moonlight-shard"
+        data_dir = inst_dir / "data"
+        data_dir.mkdir(parents=True)
+        (inst_dir / "config.toml").write_text(
+            '[game]\nhostname = "moonlight"\n[auth]\nserver = "https://auth.example/"\n[whitelist]\nenabled = true\n',
+            encoding="utf-8",
+        )
+        db_path = data_dir / "preferences.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("CREATE TABLE player (player_id INTEGER PRIMARY KEY, user_id TEXT UNIQUE, last_seen_user_name TEXT, last_seen_time TEXT)")
+            conn.execute("CREATE TABLE whitelist (user_id TEXT PRIMARY KEY)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        class Response:
+            status_code = 200
+            ok = True
+
+            @staticmethod
+            def json():
+                return {"userName": "Ren0san", "userId": "71718f43-ebd4-4460-b7f1-70f40112eaa9"}
+
+        old = {k: agent_main.os.environ.get(k) for k in ("SS14_WD_ROOT", "SS14_WD_DEDICATED_BASE")}
+        agent_main.os.environ["SS14_WD_ROOT"] = str(root / "watchdog")
+        agent_main.os.environ["SS14_WD_DEDICATED_BASE"] = str(root)
+        try:
+            with patch("agent_main.requests.get", return_value=Response()) as req:
+                ok, result, error = runtime._embedded_change_instance_whitelist_player("moonlight", "Ren0san", add=True)
+            assert ok is True, error
+            assert req.call_args_list[0].kwargs["params"] == {"name": "Ren0san"}
+            assert req.call_args_list[0].kwargs["headers"] == {"User-Agent": "SpaceStation14/1.0"}
+            assert req.call_args_list[1].kwargs["params"] == {"userid": "71718f43-ebd4-4460-b7f1-70f40112eaa9"}
+            assert result["config_path"].replace("\\", "/").endswith("watchdog-moonlight-shard/instances/moonlight-shard/config.toml")
+            assert result["changed_player"] == {
+                "username": "Ren0san",
+                "user_id": "71718F43-EBD4-4460-B7F1-70F40112EAA9",
+                "action": "add",
+            }
+            assert result["players"] == [
+                {
+                    "user_id": "71718F43-EBD4-4460-B7F1-70F40112EAA9",
+                    "username": "Ren0san",
+                    "last_seen_time": "",
+                }
+            ]
+        finally:
+            for key, value in old.items():
+                if value is None:
+                    agent_main.os.environ.pop(key, None)
+                else:
+                    agent_main.os.environ[key] = value
