@@ -644,6 +644,7 @@ class AgentRuntime:
             "set-instance-whitelist-enabled",
             "add-instance-whitelist-player",
             "remove-instance-whitelist-player",
+            "rebuild-manifest",
         ]
 
     def _resolve_agent_id(self) -> str:
@@ -2675,6 +2676,44 @@ class AgentRuntime:
             str(_env("SS14_ROBUST_CDN_BUILD_PLATFORM") or _env("SS14_MANIFEST_BUILD_PLATFORM") or "linux-x64").strip()
             or "linux-x64"
         )
+
+    def _embedded_rebuild_manifest(
+        self,
+        slug: str,
+        repo: str,
+        branch: str,
+        force_rebuild: bool,
+        cdn_service_url: str,
+        api_token: str,
+    ) -> tuple[bool, dict, str | None]:
+        slug_norm = str(slug or "").strip().lower()
+        repo_text = str(repo or "").strip()
+        branch_text = str(branch or "master").strip() or "master"
+        cdn_base = str(cdn_service_url or "").strip().rstrip("/")
+        token = str(api_token or "").strip()
+
+        if not slug_norm:
+            return False, {}, "slug is required"
+        if not repo_text:
+            return False, {}, "repo is required"
+        if not cdn_base:
+            return False, {}, "cdn_service_url is required"
+        if not token:
+            return False, {}, "api_token is required"
+
+        url = f"{cdn_base}/api/ss14/admin/instances/{quote(slug_norm, safe='')}/manifest/build"
+        try:
+            response = requests.post(
+                url,
+                headers={"X-API-Token": token},
+                json={"repo": repo_text, "branch": branch_text, "force_rebuild": bool(force_rebuild)},
+                timeout=(10.0, 5400.0),
+            )
+            response.raise_for_status()
+            data = response.json() if response.content else {}
+            return True, dict(data) if isinstance(data, dict) else {"raw": str(data)}, None
+        except Exception as exc:
+            return False, {}, f"CDN build request failed: {exc}"
 
     def _runtime_requirement_from_runtimeconfig_payload(self, payload: Any) -> dict[str, Any] | None:
         if not isinstance(payload, dict):
@@ -6070,6 +6109,15 @@ class AgentRuntime:
             )
         if kind == "reset-instance-postgres":
             return self._embedded_reset_instance_postgres(str(payload.get("slug") or ""))
+        if kind == "rebuild-manifest":
+            return self._embedded_rebuild_manifest(
+                str(payload.get("slug") or ""),
+                str(payload.get("repo") or ""),
+                str(payload.get("branch") or "master"),
+                bool(payload.get("force_rebuild", True)),
+                str(payload.get("cdn_service_url") or ""),
+                str(payload.get("api_token") or ""),
+            )
         if kind == "get-instance-whitelist":
             return self._embedded_get_instance_whitelist(str(payload.get("slug") or ""))
         if kind == "set-instance-whitelist-enabled":
