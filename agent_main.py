@@ -6314,18 +6314,8 @@ class AgentRuntime:
                     slug=slug,
                     action="update",
                 )
-                runtime_info = (result or {}).get("runtime") if isinstance(result, dict) else None
                 mode = self._instruction_schedule_mode(payload if isinstance(payload, dict) else None)
-                if ok and (mode == "force" or (isinstance(runtime_info, dict) and bool(runtime_info.get("installed")))):
-                    try:
-                        restart_delay = max(
-                            0.0,
-                            float(_env("AGENT_WATCHDOG_FORCE_UPDATE_RESTART_DELAY_SECONDS", "3") or "3"),
-                        )
-                    except Exception:
-                        restart_delay = 3.0
-                    if restart_delay > 0:
-                        time.sleep(restart_delay)
+                if ok and mode == "force":
                     restart_ok, restart_result, restart_error = self._execute_watchdog_http_action(
                         instruction_id=instruction_id,
                         kind="restart-instance",
