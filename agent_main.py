@@ -5931,6 +5931,28 @@ class AgentRuntime:
                 )
             time.sleep(min(poll_seconds, max(0.2, deadline - time.time())))
 
+    def _wait_for_instance_active(
+        self,
+        *,
+        slug: str,
+        timeout_seconds: float = 30.0,
+        poll_seconds: float = 3.0,
+        initial_sleep: float = 3.0,
+    ) -> tuple[bool, dict[str, Any]]:
+        slug_norm = str(slug or "").strip().lower()
+        if initial_sleep > 0:
+            time.sleep(float(initial_sleep))
+        deadline = time.time() + max(1.0, float(timeout_seconds))
+        last_snapshot: dict[str, Any] = {}
+        while True:
+            snapshot = self._embedded_instance_status_snapshot(slug_norm)
+            last_snapshot = snapshot if isinstance(snapshot, dict) else {}
+            if bool(last_snapshot.get("active")):
+                return True, last_snapshot
+            if time.time() >= deadline:
+                return False, last_snapshot
+            time.sleep(max(0.2, min(float(poll_seconds), deadline - time.time())))
+
     def _wait_for_instance_inactive(
         self,
         *,
@@ -6307,6 +6329,32 @@ class AgentRuntime:
                     slug=slug,
                     action="restart",
                 )
+                if ok:
+                    # The watchdog HTTP /restart may return 200 while leaving the server
+                    # stuck in a non-running state (observed with PersistServers=true after
+                    # a failed startup). Verify the server actually becomes active.
+                    try:
+                        verify_timeout = max(5.0, float(_env("AGENT_WATCHDOG_RESTART_VERIFY_SECONDS", "30") or "30"))
+                    except Exception:
+                        verify_timeout = 30.0
+                    active_ok, active_snapshot = self._wait_for_instance_active(
+                        slug=slug,
+                        timeout_seconds=verify_timeout,
+                        poll_seconds=3.0,
+                        initial_sleep=3.0,
+                    )
+                    if not active_ok:
+                        logger.warning(
+                            "Instruction id=%s kind=restart-instance slug=%s: watchdog HTTP restart returned 200 but server did not become active within %.0fs; will attempt systemctl fallback",
+                            instruction_id,
+                            slug or "-",
+                            verify_timeout,
+                        )
+                        ok = False
+                        result = dict(result or {})
+                        result["http_restart_stuck"] = True
+                        result["verify_snapshot"] = active_snapshot
+                        error = f"watchdog restart accepted (HTTP 200) but server did not start within {int(round(verify_timeout))}s"
             elif kind == "update-instance":
                 ok, result, error = self._execute_watchdog_http_action(
                     instruction_id=instruction_id,

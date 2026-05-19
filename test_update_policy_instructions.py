@@ -470,12 +470,15 @@ def test_execute_instruction_restart_includes_gentle_wait_metadata():
         runtime,
         "_wait_for_instance_empty_if_needed",
         return_value=(True, {"mode": "gentle", "players": 0, "waited_seconds": 0.0}, None),
-    ) as wait_mock:
-        with patch.object(
-            runtime,
-            "_execute_watchdog_http_action",
-            return_value=(True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/restart"}, None),
-        ) as restart_mock:
+    ) as wait_mock, patch.object(
+        runtime,
+        "_execute_watchdog_http_action",
+        return_value=(True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/restart"}, None),
+    ) as restart_mock, patch.object(
+        runtime,
+        "_wait_for_instance_active",
+        return_value=(True, {"active": True, "status": "online"}),
+    ) as active_mock:
             ok, result, error = runtime._execute_instruction(
                 {
                     "id": "inst-g2",
@@ -489,6 +492,7 @@ def test_execute_instruction_restart_includes_gentle_wait_metadata():
     assert result["schedule_wait"]["mode"] == "gentle"
     wait_mock.assert_called_once()
     restart_mock.assert_called_once()
+    active_mock.assert_called_once()
 
 
 def test_execute_instruction_update_gentle_waits_for_players_before_watchdog_update():
