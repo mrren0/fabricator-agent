@@ -2677,6 +2677,42 @@ class AgentRuntime:
             or "linux-x64"
         )
 
+    def _patch_manifest_build_log(self, build_id: str, log_text: str, api_token: str) -> bool:
+        target = str(build_id or "").strip()
+        token = str(api_token or "").strip()
+        if not target or not token or not self.backend_url:
+            return False
+        try:
+            res = requests.patch(
+                f"{self.backend_url}/api/internal/manifest/attempts/{quote(target, safe='')}/log",
+                headers={"X-API-Token": token},
+                json={"log_text": str(log_text or "")},
+                timeout=max(5, self.timeout),
+            )
+            if res.status_code >= 400:
+                logger.warning("Manifest build log patch rejected build_id=%s status=%s body=%s", target, res.status_code, res.text[:300])
+                return False
+            return True
+        except requests.RequestException as exc:
+            logger.warning("Manifest build log patch failed build_id=%s error=%s", target, exc)
+            return False
+
+    def _fetch_local_manifest_build_log(self, cdn_base: str, slug: str, build_id: str) -> str | None:
+        base = str(cdn_base or "").strip().rstrip("/")
+        slug_norm = str(slug or "").strip().lower()
+        target = str(build_id or "").strip()
+        if not base or not slug_norm or not target:
+            return None
+        url = f"{base}/api/ss14/instances/{quote(slug_norm, safe='')}/manifest/attempts/{quote(target, safe='')}/log"
+        try:
+            res = requests.get(url, timeout=max(5, self.timeout))
+        except requests.RequestException:
+            return None
+        if res.status_code != 200:
+            return None
+        text = str(res.text or "")
+        return text if text.strip() else None
+
     def _embedded_rebuild_manifest(
         self,
         slug: str,
@@ -2685,6 +2721,7 @@ class AgentRuntime:
         force_rebuild: bool,
         cdn_service_url: str,
         api_token: str,
+        build_id: str | None = None,
     ) -> tuple[bool, dict, str | None]:
         slug_norm = str(slug or "").strip().lower()
         repo_text = str(repo or "").strip()
@@ -2701,17 +2738,57 @@ class AgentRuntime:
         if not token:
             return False, {}, "api_token is required"
 
+        build_id_text = str(build_id or "").strip()
         url = f"{cdn_base}/api/ss14/admin/instances/{quote(slug_norm, safe='')}/manifest/build"
+        body = {
+            "repo": repo_text,
+            "branch": branch_text,
+            "force_rebuild": bool(force_rebuild),
+            "build_id": build_id_text or None,
+        }
+        holder: dict[str, Any] = {}
+
+        def run_build() -> None:
+            try:
+                response = requests.post(
+                    url,
+                    headers={"X-API-Token": token},
+                    json=body,
+                    timeout=(10.0, 5400.0),
+                )
+                holder["response"] = response
+            except Exception as exc:
+                holder["error"] = exc
+
+        thread = threading.Thread(target=run_build, name=f"manifest-build-{slug_norm}", daemon=True)
+        thread.start()
+        last_log = ""
+        last_patch_at = 0.0
+        while thread.is_alive():
+            if build_id_text:
+                log_text = self._fetch_local_manifest_build_log(cdn_base, slug_norm, build_id_text)
+                now = time.monotonic()
+                if log_text and log_text != last_log and (now - last_patch_at) >= 5.0:
+                    if self._patch_manifest_build_log(build_id_text, log_text, token):
+                        last_log = log_text
+                        last_patch_at = now
+            thread.join(timeout=1.0)
+        if build_id_text:
+            log_text = self._fetch_local_manifest_build_log(cdn_base, slug_norm, build_id_text)
+            if log_text and log_text != last_log:
+                self._patch_manifest_build_log(build_id_text, log_text, token)
+        if holder.get("error") is not None:
+            return False, {}, f"CDN build request failed: {holder['error']}"
+        response = holder.get("response")
         try:
-            response = requests.post(
-                url,
-                headers={"X-API-Token": token},
-                json={"repo": repo_text, "branch": branch_text, "force_rebuild": bool(force_rebuild)},
-                timeout=(10.0, 5400.0),
-            )
+            if not isinstance(response, requests.Response):
+                return False, {}, "CDN build request failed: no response"
             response.raise_for_status()
             data = response.json() if response.content else {}
-            return True, dict(data) if isinstance(data, dict) else {"raw": str(data)}, None
+            payload = dict(data) if isinstance(data, dict) else {"raw": str(data)}
+            if build_id_text:
+                payload.setdefault("build_id", build_id_text)
+            return True, payload, None
         except Exception as exc:
             return False, {}, f"CDN build request failed: {exc}"
 
@@ -6117,6 +6194,7 @@ class AgentRuntime:
                 bool(payload.get("force_rebuild", True)),
                 str(payload.get("cdn_service_url") or ""),
                 str(payload.get("api_token") or ""),
+                str(payload.get("build_id") or "").strip() or None,
             )
         if kind == "get-instance-whitelist":
             return self._embedded_get_instance_whitelist(str(payload.get("slug") or ""))

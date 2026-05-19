@@ -20,6 +20,7 @@ import agent_main
 def _runtime() -> agent_main.AgentRuntime:
     runtime = agent_main.AgentRuntime.__new__(agent_main.AgentRuntime)
     runtime.local_api_url = "http://127.0.0.1:8000"
+    runtime.backend_url = "https://api.example.test"
     runtime.timeout = 5
     runtime.status = {}
     return runtime
@@ -40,6 +41,59 @@ def test_supported_instruction_kinds_include_update_policy():
     assert "remove-instance-whitelist-player" in kinds
     assert "download-instance-data-file" in kinds
     assert "upload-instance-data-file" in kinds
+
+
+def test_rebuild_manifest_sends_build_id_and_patches_captured_log():
+    runtime = _runtime()
+    posted = {}
+    patched = {}
+
+    class LogResponse:
+        status_code = 200
+        text = "git clone\nResolved commit abc123\n"
+
+    class PatchResponse:
+        status_code = 200
+        text = '{"ok":true}'
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        posted["url"] = url
+        posted["headers"] = headers
+        posted["json"] = json
+        response = agent_main.requests.Response()
+        response.status_code = 200
+        response._content = b'{"manifest_url":"https://cdn.example/manifest","status":"ready"}'
+        return response
+
+    def fake_get(url, timeout=None):
+        posted["log_url"] = url
+        return LogResponse()
+
+    def fake_patch(url, headers=None, json=None, timeout=None):
+        patched["url"] = url
+        patched["headers"] = headers
+        patched["json"] = json
+        return PatchResponse()
+
+    with patch.object(agent_main.requests, "post", side_effect=fake_post), patch.object(
+        agent_main.requests, "get", side_effect=fake_get
+    ), patch.object(agent_main.requests, "patch", side_effect=fake_patch):
+        ok, result, error = runtime._embedded_rebuild_manifest(
+            "moonlight-shard",
+            "https://github.com/org/repo",
+            "master",
+            True,
+            "http://127.0.0.1:13001",
+            "master-token",
+            "build-123",
+        )
+
+    assert ok is True
+    assert error is None
+    assert posted["json"]["build_id"] == "build-123"
+    assert result["build_id"] == "build-123"
+    assert "/api/internal/manifest/attempts/build-123/log" in patched["url"]
+    assert "Resolved commit abc123" in patched["json"]["log_text"]
 
 
 def test_resolve_watchdog_api_base_url_uses_local_default_for_embedded_instance():
