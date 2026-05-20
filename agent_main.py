@@ -5890,52 +5890,75 @@ class AgentRuntime:
             timeout_seconds,
             curl_preview,
         )
+        # Retry up to 3 times on 404 — watchdog returns 404 briefly after restart while loading config
         try:
-            res = requests.post(
-                url,
-                auth=(slug_norm, token),
-                headers=headers or None,
-                timeout=timeout_seconds,
-            )
-        except requests.ReadTimeout as exc:
-            logger.error(
-                "Instruction id=%s kind=%s slug=%s watchdog request timed out url=%s timeout_seconds=%.1f error=%s",
+            _404_retries = max(0, int(_env("AGENT_WATCHDOG_404_RETRIES", "2") or "2"))
+        except Exception:
+            _404_retries = 2
+        try:
+            _404_retry_delay = max(1.0, float(_env("AGENT_WATCHDOG_404_RETRY_DELAY_SECONDS", "5") or "5"))
+        except Exception:
+            _404_retry_delay = 5.0
+        res = None
+        for _attempt in range(1 + _404_retries):
+            try:
+                res = requests.post(
+                    url,
+                    auth=(slug_norm, token),
+                    headers=headers or None,
+                    timeout=timeout_seconds,
+                )
+            except requests.ReadTimeout as exc:
+                logger.error(
+                    "Instruction id=%s kind=%s slug=%s watchdog request timed out url=%s timeout_seconds=%.1f error=%s",
+                    instruction_id,
+                    kind,
+                    slug_norm,
+                    url,
+                    timeout_seconds,
+                    exc,
+                )
+                return (
+                    False,
+                    {
+                        "watchdog_url": base_url,
+                        "url": url,
+                        "timeout_seconds": timeout_seconds,
+                        "curl": curl_preview,
+                    },
+                    f"watchdog request timed out after {int(round(timeout_seconds))}s: {exc}",
+                )
+            except requests.RequestException as exc:
+                logger.error(
+                    "Instruction id=%s kind=%s slug=%s watchdog request failed url=%s error=%s",
+                    instruction_id,
+                    kind,
+                    slug_norm,
+                    url,
+                    exc,
+                )
+                return (
+                    False,
+                    {
+                        "watchdog_url": base_url,
+                        "url": url,
+                        "timeout_seconds": timeout_seconds,
+                        "curl": curl_preview,
+                    },
+                    f"watchdog request failed: {exc}",
+                )
+            if res.status_code != 404 or _attempt >= _404_retries:
+                break
+            logger.warning(
+                "Instruction id=%s kind=%s slug=%s watchdog returned 404 (attempt %d/%d); retrying in %.1fs (watchdog may be starting up)",
                 instruction_id,
                 kind,
                 slug_norm,
-                url,
-                timeout_seconds,
-                exc,
+                _attempt + 1,
+                1 + _404_retries,
+                _404_retry_delay,
             )
-            return (
-                False,
-                {
-                    "watchdog_url": base_url,
-                    "url": url,
-                    "timeout_seconds": timeout_seconds,
-                    "curl": curl_preview,
-                },
-                f"watchdog request timed out after {int(round(timeout_seconds))}s: {exc}",
-            )
-        except requests.RequestException as exc:
-            logger.error(
-                "Instruction id=%s kind=%s slug=%s watchdog request failed url=%s error=%s",
-                instruction_id,
-                kind,
-                slug_norm,
-                url,
-                exc,
-            )
-            return (
-                False,
-                {
-                    "watchdog_url": base_url,
-                    "url": url,
-                    "timeout_seconds": timeout_seconds,
-                    "curl": curl_preview,
-                },
-                f"watchdog request failed: {exc}",
-            )
+            time.sleep(_404_retry_delay)
         try:
             data: Any = res.json()
         except Exception:
