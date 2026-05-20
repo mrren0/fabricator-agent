@@ -2761,11 +2761,12 @@ class AgentRuntime:
         slug_norm = str(slug or "").strip().lower()
         repo_text = str(repo or "").strip()
         branch_text = str(branch or "master").strip() or "master"
-        # CDN is always co-located on port 13001 — IaC invariant.
-        # Ignore provisioner-supplied cdn_service_url: it points to the provisioner's
-        # own CDN host and would cause cross-node build misrouting (e.g. kilo agent
-        # building on thunder's CDN). The agent always uses its own local CDN.
-        cdn_base = "http://127.0.0.1:13001"
+        # Use provisioner-supplied cdn_service_url if it's the instance's own CDN URL.
+        # Fall back to localhost:13001 only when the agent runs directly on the CDN host
+        # (no container isolation). When the agent is inside an LXC container, it cannot
+        # reach the host CDN via 127.0.0.1 — the provisioner must send cdn_url explicitly.
+        _supplied = str(cdn_service_url or "").strip().rstrip("/")
+        cdn_base = _supplied if _supplied else "http://127.0.0.1:13001"
         token = str(api_token or "").strip()
 
         if not slug_norm:
