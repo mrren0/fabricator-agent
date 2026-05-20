@@ -2597,7 +2597,13 @@ class AgentRuntime:
         if str(update_mode or "").strip().lower() == "cdn":
             manifest = str(manifest_url or "").strip()
             if not manifest:
-                manifest = f"https://cdn.thun-der.ru/api/ss14/instances/{slug}/manifest"
+                _cdn_base = (
+                    _env("CONTROL_SERVICE_CDN_URL")
+                    or _env("SS14_ROBUST_CDN_BASE_URL")
+                    or _env("SS14_MANIFEST_BASE_URL")
+                    or "https://cdn.thun-der.ru"
+                ).strip().rstrip("/")
+                manifest = f"{_cdn_base}/api/ss14/instances/{slug}/manifest"
             update_block = (
                 f"      UpdateType: \"Manifest\"\n"
                 f"      Updates:\n"
