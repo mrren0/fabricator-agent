@@ -2761,16 +2761,11 @@ class AgentRuntime:
         slug_norm = str(slug or "").strip().lower()
         repo_text = str(repo or "").strip()
         branch_text = str(branch or "master").strip() or "master"
-        # Agent is co-located with its CDN — always prefer the local CDN service.
-        # SS14_ROBUST_CDN_SERVICE_INTERNAL_URL overrides (set by IaC for CDN nodes).
-        # cdn_service_url from the provisioner is a fallback only; it may point to the
-        # wrong CDN when the provisioner hosts multiple nodes with different CDNs.
-        cdn_base = (
-            _env("SS14_ROBUST_CDN_SERVICE_INTERNAL_URL")
-            or _env("AGENT_CDN_SERVICE_URL")
-            or str(cdn_service_url or "")
-            or "http://127.0.0.1:13001"
-        ).strip().rstrip("/")
+        # CDN is always co-located on port 13001 — IaC invariant.
+        # Ignore provisioner-supplied cdn_service_url: it points to the provisioner's
+        # own CDN host and would cause cross-node build misrouting (e.g. kilo agent
+        # building on thunder's CDN). The agent always uses its own local CDN.
+        cdn_base = "http://127.0.0.1:13001"
         token = str(api_token or "").strip()
 
         if not slug_norm:
