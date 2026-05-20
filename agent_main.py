@@ -5972,6 +5972,70 @@ class AgentRuntime:
                 return False, last_snapshot
             time.sleep(max(0.2, float(poll_seconds)))
 
+    def _execute_verified_restart(
+        self,
+        *,
+        instruction_id: str,
+        slug: str,
+        kind: str,
+    ) -> tuple[bool, dict[str, Any], str | None]:
+        ok, result, error = self._execute_watchdog_http_action(
+            instruction_id=instruction_id,
+            kind="restart-instance",
+            slug=slug,
+            action="restart",
+        )
+        if ok:
+            # The watchdog HTTP /restart may return 200 while leaving the server
+            # stuck in a non-running state (observed with PersistServers=true after
+            # a failed startup). Verify the server actually becomes active.
+            try:
+                verify_timeout = max(5.0, float(_env("AGENT_WATCHDOG_RESTART_VERIFY_SECONDS", "30") or "30"))
+            except Exception:
+                verify_timeout = 30.0
+            active_ok, active_snapshot = self._wait_for_instance_active(
+                slug=slug,
+                timeout_seconds=verify_timeout,
+                poll_seconds=3.0,
+                initial_sleep=3.0,
+            )
+            if not active_ok:
+                logger.warning(
+                    "Instruction id=%s kind=%s slug=%s: watchdog HTTP restart returned 200 but server did not become active within %.0fs; will attempt systemctl fallback",
+                    instruction_id,
+                    kind,
+                    slug or "-",
+                    verify_timeout,
+                )
+                ok = False
+                result = dict(result or {})
+                result["http_restart_stuck"] = True
+                result["verify_snapshot"] = active_snapshot
+                error = f"watchdog restart accepted (HTTP 200) but server did not start within {int(round(verify_timeout))}s"
+        if ok:
+            return True, dict(result or {}), None
+        if _env_bool("AGENT_WATCHDOG_RESTART_SYSTEMCTL_FALLBACK", True):
+            restart_ok, restart_result, restart_error = self._execute_watchdog_service_restart(
+                instruction_id=instruction_id,
+                kind=kind,
+                slug=slug,
+            )
+            if restart_ok:
+                merged = dict(restart_result or {})
+                merged["fallback"] = "systemctl-restart"
+                merged["watchdog_http_error"] = error
+                merged["watchdog_http_result"] = result
+                return True, merged, None
+            logger.warning(
+                "Instruction id=%s kind=%s slug=%s direct watchdog restart failed; systemctl restart fallback also failed: %s result=%s",
+                instruction_id,
+                kind,
+                slug or "-",
+                str(restart_error or "-"),
+                _log_tail(restart_result or {}),
+            )
+        return False, dict(result or {}), error
+
     def _execute_watchdog_service_restart(
         self,
         *,
@@ -6323,38 +6387,11 @@ class AgentRuntime:
             if not wait_ok:
                 return False, dict(wait_meta or {}), wait_error
             if kind == "restart-instance":
-                ok, result, error = self._execute_watchdog_http_action(
+                ok, result, error = self._execute_verified_restart(
                     instruction_id=instruction_id,
-                    kind=kind,
                     slug=slug,
-                    action="restart",
+                    kind=kind,
                 )
-                if ok:
-                    # The watchdog HTTP /restart may return 200 while leaving the server
-                    # stuck in a non-running state (observed with PersistServers=true after
-                    # a failed startup). Verify the server actually becomes active.
-                    try:
-                        verify_timeout = max(5.0, float(_env("AGENT_WATCHDOG_RESTART_VERIFY_SECONDS", "30") or "30"))
-                    except Exception:
-                        verify_timeout = 30.0
-                    active_ok, active_snapshot = self._wait_for_instance_active(
-                        slug=slug,
-                        timeout_seconds=verify_timeout,
-                        poll_seconds=3.0,
-                        initial_sleep=3.0,
-                    )
-                    if not active_ok:
-                        logger.warning(
-                            "Instruction id=%s kind=restart-instance slug=%s: watchdog HTTP restart returned 200 but server did not become active within %.0fs; will attempt systemctl fallback",
-                            instruction_id,
-                            slug or "-",
-                            verify_timeout,
-                        )
-                        ok = False
-                        result = dict(result or {})
-                        result["http_restart_stuck"] = True
-                        result["verify_snapshot"] = active_snapshot
-                        error = f"watchdog restart accepted (HTTP 200) but server did not start within {int(round(verify_timeout))}s"
             elif kind == "update-instance":
                 ok, result, error = self._execute_watchdog_http_action(
                     instruction_id=instruction_id,
@@ -6364,11 +6401,10 @@ class AgentRuntime:
                 )
                 mode = self._instruction_schedule_mode(payload if isinstance(payload, dict) else None)
                 if ok and mode == "force":
-                    restart_ok, restart_result, restart_error = self._execute_watchdog_http_action(
+                    restart_ok, restart_result, restart_error = self._execute_verified_restart(
                         instruction_id=instruction_id,
-                        kind="restart-instance",
                         slug=slug,
-                        action="restart",
+                        kind=kind,
                     )
                     if not restart_ok:
                         merged = dict(result or {})
@@ -6402,28 +6438,6 @@ class AgentRuntime:
                     result = dict(result or {})
                     result["schedule_wait"] = wait_meta
                 return True, result, None
-            if kind == "restart-instance" and _env_bool("AGENT_WATCHDOG_RESTART_SYSTEMCTL_FALLBACK", True):
-                restart_ok, restart_result, restart_error = self._execute_watchdog_service_restart(
-                    instruction_id=instruction_id,
-                    kind=kind,
-                    slug=slug,
-                )
-                if restart_ok:
-                    merged = dict(restart_result or {})
-                    merged["fallback"] = "systemctl-restart"
-                    merged["watchdog_http_error"] = error
-                    merged["watchdog_http_result"] = result
-                    if wait_meta:
-                        merged["schedule_wait"] = wait_meta
-                    return True, merged, None
-                logger.warning(
-                    "Instruction id=%s kind=%s slug=%s direct watchdog restart failed; systemctl restart fallback also failed: %s result=%s",
-                    instruction_id,
-                    kind,
-                    slug or "-",
-                    str(restart_error or "-"),
-                    _log_tail(restart_result or {}),
-                )
             if kind == "stop-instance" and _env_bool("AGENT_WATCHDOG_STOP_SYSTEMCTL_FALLBACK", True):
                 stop_ok, stop_result, stop_error = self._execute_watchdog_service_stop(
                     instruction_id=instruction_id,

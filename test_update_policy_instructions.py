@@ -536,11 +536,12 @@ def test_execute_instruction_update_force_restarts_after_watchdog_update():
     ) as wait_mock, patch.object(
         runtime,
         "_execute_watchdog_http_action",
-        side_effect=[
-            (True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/update"}, None),
-            (True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/restart"}, None),
-        ],
-    ) as update_mock, patch.object(agent_main.time, "sleep", return_value=None) as sleep_mock:
+        return_value=(True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/update"}, None),
+    ) as update_mock, patch.object(
+        runtime,
+        "_execute_verified_restart",
+        return_value=(True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/restart"}, None),
+    ) as restart_mock:
             ok, result, error = runtime._execute_instruction(
                 {
                     "id": "inst-u2",
@@ -554,8 +555,12 @@ def test_execute_instruction_update_force_restarts_after_watchdog_update():
     assert result["forced_restart"]["status_code"] == 200
     assert result["forced_restart"]["url"].endswith("/instances/srv-1/restart")
     wait_mock.assert_called_once()
-    assert update_mock.call_count == 2
-    sleep_mock.assert_called_once()
+    update_mock.assert_called_once()
+    restart_mock.assert_called_once_with(
+        instruction_id="inst-u2",
+        slug="srv-1",
+        kind="update-instance",
+    )
 
 
 def test_database_values_ignore_commented_postgres_lines():
