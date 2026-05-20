@@ -141,6 +141,35 @@ def _normalize_host(raw: str | None) -> str:
     return s.strip()
 
 
+def _normalize_url_target(raw: str | None) -> tuple[str, int | None]:
+    s = str(raw or "").strip()
+    if not s:
+        return "", None
+    try:
+        parsed = urlparse(s if "://" in s else f"dummy://{s}")
+        host = (parsed.hostname or "").strip()
+        port = parsed.port
+        if host:
+            return host, port
+    except Exception:
+        pass
+    host = _normalize_host(s)
+    port: int | None = None
+    try:
+        tail = s.split("://", 1)[-1].split("/", 1)[0]
+        if ":" in tail:
+            port = int(tail.rsplit(":", 1)[-1])
+    except Exception:
+        port = None
+    return host, port
+
+
+def _same_url_target(left: str | None, right: str | None) -> bool:
+    left_host, left_port = _normalize_url_target(left)
+    right_host, right_port = _normalize_url_target(right)
+    return bool(left_host) and bool(right_host) and left_host == right_host and left_port == right_port
+
+
 def _is_ip_literal(value: str | None) -> bool:
     host = _normalize_host(value)
     if not host:
@@ -6167,7 +6196,47 @@ class AgentRuntime:
         if expectation:
             result["expected_manifest"] = expectation
         if not ok:
-            return False, result, error
+            recoverable_request_error = str(error or "").startswith("watchdog request ")
+            if recoverable_request_error:
+                restart_ok, restart_result, restart_error = self._execute_watchdog_service_restart(
+                    instruction_id=instruction_id,
+                    kind=kind,
+                    slug=slug,
+                )
+                recovery = {
+                    "initial_error": error,
+                    "initial_result": dict(result or {}),
+                    "service_restart": dict(restart_result or {}),
+                    "service_restart_ok": restart_ok,
+                }
+                result["watchdog_recovery"] = recovery
+                if restart_ok:
+                    retry_ok, retry_result, retry_error = self._execute_watchdog_http_action(
+                        instruction_id=instruction_id,
+                        kind=kind,
+                        slug=slug,
+                        action="update",
+                    )
+                    retry_result = dict(retry_result or {})
+                    if expectation:
+                        retry_result["expected_manifest"] = expectation
+                    recovery["retry_result"] = dict(retry_result or {})
+                    if retry_ok:
+                        result = retry_result
+                        result["watchdog_recovery"] = recovery
+                    else:
+                        recovery["retry_error"] = retry_error
+                        result = dict(retry_result or {})
+                        result["watchdog_recovery"] = recovery
+                        return False, result, f"watchdog update retry after service restart failed: {retry_error}"
+                else:
+                    return (
+                        False,
+                        result,
+                        f"watchdog update failed and watchdog service restart recovery failed: {restart_error or error}",
+                    )
+            else:
+                return False, result, error
         if mode != "force":
             return True, result, None
 
@@ -6669,6 +6738,21 @@ class AgentRuntime:
                 str(error or "-"),
                 _log_tail(result or {}),
             )
+            if (
+                kind in {"restart-instance", "update-instance", "stop-instance"}
+                and str(error or "").startswith("watchdog request ")
+                and _same_url_target(str((result or {}).get("watchdog_url") or ""), self.local_api_url or _default_local_api_url())
+            ):
+                logger.warning(
+                    "Instruction id=%s kind=%s slug=%s skipping local API fallback because watchdog and local API targets are the same unreachable endpoint",
+                    instruction_id,
+                    kind,
+                    slug or "-",
+                )
+                if wait_meta and isinstance(result, dict):
+                    result = dict(result or {})
+                    result["schedule_wait"] = wait_meta
+                return False, dict(result or {}), error
         if kind in {
             "create-instance",
             "delete-instance",

@@ -646,6 +646,77 @@ def test_execute_verified_update_force_fails_when_manifest_artifact_not_applied(
     assert result["manifest_apply"]["applied"] is False
 
 
+def test_execute_verified_update_restarts_watchdog_and_retries_when_api_is_unreachable():
+    runtime = _runtime()
+
+    with patch.object(runtime, "_manifest_client_expectation", return_value=None), patch.object(
+        runtime,
+        "_execute_watchdog_http_action",
+        side_effect=[
+            (False, {"watchdog_url": "http://127.0.0.1:8000", "url": "http://127.0.0.1:8000/instances/srv-1/update"}, "watchdog request failed: connection refused"),
+            (True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/update"}, None),
+        ],
+    ) as update_mock, patch.object(
+        runtime,
+        "_execute_watchdog_service_restart",
+        return_value=(True, {"status_code": 200, "service": "ss14-watchdog-srv-1"}, None),
+    ) as restart_mock:
+        ok, result, error = runtime._execute_verified_update(
+            instruction_id="inst-u5",
+            slug="srv-1",
+            kind="update-instance",
+            mode="gentle",
+        )
+
+    assert ok is True
+    assert error is None
+    assert result["status_code"] == 200
+    assert result["watchdog_recovery"]["service_restart_ok"] is True
+    assert result["watchdog_recovery"]["service_restart"]["service"] == "ss14-watchdog-srv-1"
+    assert update_mock.call_count == 2
+    restart_mock.assert_called_once_with(
+        instruction_id="inst-u5",
+        kind="update-instance",
+        slug="srv-1",
+    )
+
+
+def test_execute_instruction_update_does_not_fallback_to_same_dead_local_api_target():
+    runtime = _runtime()
+
+    with patch.object(
+        runtime,
+        "_wait_for_instance_empty_if_needed",
+        return_value=(True, None, None),
+    ), patch.object(
+        runtime,
+        "_execute_verified_update",
+        return_value=(
+            False,
+            {"watchdog_url": "http://127.0.0.1:8000", "url": "http://127.0.0.1:8000/instances/srv-1/update"},
+            "watchdog request failed: connection refused",
+        ),
+    ) as update_mock, patch.object(agent_main.requests, "request") as request_mock:
+        ok, result, error = runtime._execute_instruction(
+            {
+                "id": "inst-u6",
+                "kind": "update-instance",
+                "payload": {"slug": "srv-1", "schedule_mode": "force"},
+            }
+        )
+
+    assert ok is False
+    assert error == "watchdog request failed: connection refused"
+    assert result["watchdog_url"] == "http://127.0.0.1:8000"
+    update_mock.assert_called_once_with(
+        instruction_id="inst-u6",
+        slug="srv-1",
+        kind="update-instance",
+        mode="force",
+    )
+    request_mock.assert_not_called()
+
+
 def test_database_values_ignore_commented_postgres_lines():
     runtime = _runtime()
 
