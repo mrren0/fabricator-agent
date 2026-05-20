@@ -505,6 +505,7 @@ class AgentRuntime:
     def __init__(self) -> None:
         self.test_mode = _env_bool("AGENT_TEST_MODE", False)
         self.backend_url = (_env("AGENT_BACKEND_URL", "https://api.thun-der.ru") or "").rstrip("/")
+        self.relay_url = (_env("AGENT_RELAY_URL") or "").rstrip("/")
         self.api_token = _env("AGENT_API_TOKEN") or _env("SS14_API_TOKEN")
         self.agent_token = _env("AGENT_TOKEN")
         self.admin_token = _env("AGENT_ADMIN_TOKEN")
@@ -1236,6 +1237,7 @@ class AgentRuntime:
                     "agent_installed_at": AGENT_INSTALLED_AT,
                 },
                 "remote_instances": self._heartbeat_remote_instances_payload(),
+                "relay_url": self.relay_url or None,
             }
             res = requests.post(
                 f"{self.backend_url}/api/agent/runtime/{self.agent_id}/heartbeat",
@@ -1311,33 +1313,43 @@ class AgentRuntime:
             request_timeout,
         )
         if self.agent_token:
+            poll_url_base = self.relay_url or self.backend_url
+            poll_path_prefix = "/relay" if self.relay_url else ""
             logger.info(
-                "Polling master for instructions agent_id=%s limit=%s wait_seconds=%s",
+                "Polling for instructions agent_id=%s url=%s relay=%s limit=%s wait_seconds=%s",
                 self.agent_id,
+                poll_url_base,
+                bool(self.relay_url),
                 self.instruction_limit,
                 wait_seconds,
             )
             try:
                 res = requests.get(
-                    f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions",
+                    f"{poll_url_base}{poll_path_prefix}/api/agent/runtime/{self.agent_id}/instructions",
                     params={"limit": int(self.instruction_limit), "wait_seconds": wait_seconds},
                     headers=self._runtime_headers(),
                     timeout=request_timeout,
                 )
-            except requests.ReadTimeout:
-                elapsed_ms = (time.monotonic() - pull_started_monotonic) * 1000.0
-                self.status["last_pull_http_status"] = None
-                self.status["last_pull_completed_at"] = time.time()
-                self.status["last_pull_duration_ms"] = round(elapsed_ms, 3)
-                self.status["last_pull_instruction_ids"] = []
-                logger.warning(
-                    "Instruction pull timed out mode=%s wait_seconds=%s timeout_seconds=%s elapsed_ms=%.1f",
-                    pull_mode,
-                    wait_seconds,
-                    request_timeout,
-                    elapsed_ms,
-                )
-                return [], float(self.poll_seconds)
+            except Exception as relay_exc:
+                if self.relay_url:
+                    logger.warning("Relay poll failed (%s), falling back to backend", relay_exc)
+                    try:
+                        res = requests.get(
+                            f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions",
+                            params={"limit": int(self.instruction_limit), "wait_seconds": wait_seconds},
+                            headers=self._runtime_headers(),
+                            timeout=request_timeout,
+                        )
+                    except requests.ReadTimeout:
+                        elapsed_ms = (time.monotonic() - pull_started_monotonic) * 1000.0
+                        self.status["last_pull_http_status"] = None
+                        self.status["last_pull_completed_at"] = time.time()
+                        self.status["last_pull_duration_ms"] = round(elapsed_ms, 3)
+                        self.status["last_pull_instruction_ids"] = []
+                        logger.warning("Instruction pull timed out (fallback) elapsed_ms=%.1f", elapsed_ms)
+                        return [], float(self.poll_seconds)
+                else:
+                    raise
             self.status["last_pull_http_status"] = int(res.status_code)
             if res.status_code == 401:
                 self._invalidate_runtime_token("Runtime token rejected while pulling; re-enrolling")
