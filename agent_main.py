@@ -2863,6 +2863,118 @@ class AgentRuntime:
         payload = response.json()
         return self._runtime_requirement_from_manifest_payload(payload)
 
+    def _embedded_fetch_manifest_payload(self, manifest_url: str | None) -> dict[str, Any] | None:
+        url = str(manifest_url or "").strip()
+        if not url:
+            return None
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else None
+
+    def _latest_manifest_build_payload(self, payload: dict[str, Any] | None) -> tuple[str | None, dict[str, Any] | None]:
+        if not isinstance(payload, dict):
+            return None, None
+        builds = payload.get("builds")
+        if not isinstance(builds, dict):
+            return None, None
+        ordered = sorted(
+            builds.items(),
+            key=lambda item: str(((item[1] or {}).get("time") if isinstance(item[1], dict) else "") or item[0]),
+            reverse=True,
+        )
+        for version, build in ordered:
+            if isinstance(build, dict):
+                return str(version or "").strip() or None, build
+        return None, None
+
+    def _embedded_client_zip_path(self, slug: str) -> Path:
+        slug_norm = str(slug or "").strip().lower()
+        _, _, wd_root = self._embedded_watchdog_layout(slug_norm)
+        return wd_root / "instances" / slug_norm / "bin" / "Content.Client.zip"
+
+    def _file_sha256(self, path: Path) -> str | None:
+        try:
+            if not path.is_file():
+                return None
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            return digest.hexdigest().lower()
+        except Exception:
+            logger.exception("Failed to compute sha256 for %s", path)
+            return None
+
+    def _manifest_client_expectation(self, slug: str) -> dict[str, Any] | None:
+        ok, policy, error = self._embedded_get_instance_update_policy(slug)
+        if not ok:
+            logger.warning("Failed to read update policy for slug=%s before update verification: %s", slug, error or "-")
+            return None
+        if str(policy.get("update_mode") or "").strip().lower() != "cdn":
+            return None
+        manifest_url = str(policy.get("manifest_url") or "").strip()
+        if not manifest_url:
+            return None
+        try:
+            payload = self._embedded_fetch_manifest_payload(manifest_url)
+        except Exception as exc:
+            logger.warning("Failed to fetch manifest payload for slug=%s manifest=%s: %s", slug, manifest_url, exc)
+            return None
+        version, build = self._latest_manifest_build_payload(payload)
+        client = (build or {}).get("client") if isinstance(build, dict) else None
+        if not isinstance(client, dict):
+            return None
+        client_sha256 = str(client.get("sha256") or "").strip().lower()
+        if not client_sha256:
+            return None
+        return {
+            "manifest_url": manifest_url,
+            "version": version,
+            "client_sha256": client_sha256,
+            "client_url": str(client.get("url") or "").strip() or None,
+        }
+
+    def _wait_for_manifest_client_artifact(
+        self,
+        *,
+        slug: str,
+        expected: dict[str, Any] | None,
+        timeout_seconds: float,
+        poll_seconds: float = 3.0,
+    ) -> tuple[bool, dict[str, Any]]:
+        info = dict(expected or {})
+        path = self._embedded_client_zip_path(slug)
+        info["client_zip_path"] = str(path)
+        wanted_sha = str(info.get("client_sha256") or "").strip().lower()
+        if not wanted_sha:
+            info["skipped"] = True
+            info["reason"] = "missing expected client sha256"
+            return True, info
+        deadline = time.time() + max(1.0, float(timeout_seconds))
+        last_sha = ""
+        last_mtime = None
+        while True:
+            if path.is_file():
+                last_sha = str(self._file_sha256(path) or "").strip().lower()
+                try:
+                    last_mtime = path.stat().st_mtime
+                except Exception:
+                    last_mtime = None
+                if last_sha == wanted_sha:
+                    info["applied"] = True
+                    info["observed_client_sha256"] = last_sha
+                    info["observed_client_mtime"] = last_mtime
+                    return True, info
+            if time.time() >= deadline:
+                info["applied"] = False
+                info["observed_client_sha256"] = last_sha or None
+                info["observed_client_mtime"] = last_mtime
+                return False, info
+            time.sleep(max(0.2, min(float(poll_seconds), deadline - time.time())))
+
     def _embedded_instance_runtime_requirement(self, slug: str) -> dict[str, Any] | None:
         slug_norm = str(slug or "").strip().lower()
         if not slug_norm:
@@ -6036,6 +6148,103 @@ class AgentRuntime:
             )
         return False, dict(result or {}), error
 
+    def _execute_verified_update(
+        self,
+        *,
+        instruction_id: str,
+        slug: str,
+        kind: str,
+        mode: str,
+    ) -> tuple[bool, dict[str, Any], str | None]:
+        expectation = self._manifest_client_expectation(slug)
+        ok, result, error = self._execute_watchdog_http_action(
+            instruction_id=instruction_id,
+            kind=kind,
+            slug=slug,
+            action="update",
+        )
+        result = dict(result or {})
+        if expectation:
+            result["expected_manifest"] = expectation
+        if not ok:
+            return False, result, error
+        if mode != "force":
+            return True, result, None
+
+        try:
+            drain_timeout = max(5.0, float(_env("AGENT_FORCE_UPDATE_DRAIN_SECONDS", "90") or "90"))
+        except Exception:
+            drain_timeout = 90.0
+        inactive_ok, inactive_snapshot = self._wait_for_instance_inactive(
+            slug=slug,
+            timeout_seconds=drain_timeout,
+            poll_seconds=1.0,
+        )
+        result["update_drain"] = {
+            "timeout_seconds": drain_timeout,
+            "became_inactive": inactive_ok,
+            "last_snapshot": inactive_snapshot,
+        }
+
+        if inactive_ok:
+            try:
+                auto_restart_timeout = max(5.0, float(_env("AGENT_FORCE_UPDATE_AUTORESTART_SECONDS", "30") or "30"))
+            except Exception:
+                auto_restart_timeout = 30.0
+            active_ok, active_snapshot = self._wait_for_instance_active(
+                slug=slug,
+                timeout_seconds=auto_restart_timeout,
+                poll_seconds=2.0,
+                initial_sleep=1.0,
+            )
+            result["post_update_active_check"] = {
+                "timeout_seconds": auto_restart_timeout,
+                "became_active": active_ok,
+                "last_snapshot": active_snapshot,
+            }
+            if not active_ok:
+                restart_ok, restart_result, restart_error = self._execute_verified_restart(
+                    instruction_id=instruction_id,
+                    slug=slug,
+                    kind=kind,
+                )
+                if not restart_ok:
+                    result["restart_result"] = restart_result
+                    result["restart_error"] = restart_error
+                    return False, result, f"watchdog update completed, but restart after drain failed: {restart_error}"
+                result["forced_restart"] = restart_result
+        else:
+            restart_ok, restart_result, restart_error = self._execute_verified_restart(
+                instruction_id=instruction_id,
+                slug=slug,
+                kind=kind,
+            )
+            if not restart_ok:
+                result["restart_result"] = restart_result
+                result["restart_error"] = restart_error
+                return False, result, f"watchdog update completed, but forced restart failed: {restart_error}"
+            result["forced_restart"] = restart_result
+
+        if expectation:
+            try:
+                artifact_timeout = max(10.0, float(_env("AGENT_FORCE_UPDATE_ARTIFACT_VERIFY_SECONDS", "180") or "180"))
+            except Exception:
+                artifact_timeout = 180.0
+            artifact_ok, artifact_meta = self._wait_for_manifest_client_artifact(
+                slug=slug,
+                expected=expectation,
+                timeout_seconds=artifact_timeout,
+                poll_seconds=3.0,
+            )
+            result["manifest_apply"] = artifact_meta
+            if not artifact_ok:
+                return (
+                    False,
+                    result,
+                    "watchdog update/restart completed, but the latest manifest artifact was not applied locally",
+                )
+        return True, result, None
+
     def _execute_watchdog_service_restart(
         self,
         *,
@@ -6393,27 +6602,13 @@ class AgentRuntime:
                     kind=kind,
                 )
             elif kind == "update-instance":
-                ok, result, error = self._execute_watchdog_http_action(
-                    instruction_id=instruction_id,
-                    kind=kind,
-                    slug=slug,
-                    action="update",
-                )
                 mode = self._instruction_schedule_mode(payload if isinstance(payload, dict) else None)
-                if ok and mode == "force":
-                    restart_ok, restart_result, restart_error = self._execute_verified_restart(
-                        instruction_id=instruction_id,
-                        slug=slug,
-                        kind=kind,
-                    )
-                    if not restart_ok:
-                        merged = dict(result or {})
-                        merged["restart_error"] = restart_error
-                        merged["restart_result"] = restart_result
-                        return False, merged, f"watchdog update succeeded, but forced restart failed: {restart_error}"
-                    merged = dict(result or {})
-                    merged["forced_restart"] = restart_result
-                    return True, merged, None
+                ok, result, error = self._execute_verified_update(
+                    instruction_id=instruction_id,
+                    slug=slug,
+                    kind=kind,
+                    mode=mode,
+                )
             else:
                 mode = self._instruction_schedule_mode(payload if isinstance(payload, dict) else None)
                 ok, result, error = self._execute_watchdog_http_action(

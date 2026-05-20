@@ -505,7 +505,7 @@ def test_execute_instruction_update_gentle_waits_for_players_before_watchdog_upd
     ) as wait_mock:
         with patch.object(
             runtime,
-            "_execute_watchdog_http_action",
+            "_execute_verified_update",
             return_value=(True, {"status_code": 200}, None),
         ) as update_mock:
             with patch.object(runtime, "_execute_watchdog_service_restart") as restart_mock:
@@ -522,11 +522,16 @@ def test_execute_instruction_update_gentle_waits_for_players_before_watchdog_upd
     assert result["status_code"] == 200
     assert result["schedule_wait"]["mode"] == "gentle"
     wait_mock.assert_called_once()
-    update_mock.assert_called_once()
+    update_mock.assert_called_once_with(
+        instruction_id="inst-u1",
+        slug="srv-1",
+        kind="update-instance",
+        mode="gentle",
+    )
     restart_mock.assert_not_called()
 
 
-def test_execute_instruction_update_force_restarts_after_watchdog_update():
+def test_execute_instruction_update_force_uses_verified_update_flow():
     runtime = _runtime()
 
     with patch.object(
@@ -535,12 +540,11 @@ def test_execute_instruction_update_force_restarts_after_watchdog_update():
         return_value=(True, None, None),
     ) as wait_mock, patch.object(
         runtime,
-        "_execute_watchdog_http_action",
-        return_value=(True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/update"}, None),
+        "_execute_verified_update",
+        return_value=(True, {"status_code": 200, "forced_restart": {"status_code": 200}}, None),
     ) as update_mock, patch.object(
         runtime,
         "_execute_verified_restart",
-        return_value=(True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/restart"}, None),
     ) as restart_mock:
             ok, result, error = runtime._execute_instruction(
                 {
@@ -553,14 +557,93 @@ def test_execute_instruction_update_force_restarts_after_watchdog_update():
     assert ok is True
     assert error is None
     assert result["forced_restart"]["status_code"] == 200
-    assert result["forced_restart"]["url"].endswith("/instances/srv-1/restart")
     wait_mock.assert_called_once()
-    update_mock.assert_called_once()
-    restart_mock.assert_called_once_with(
+    update_mock.assert_called_once_with(
         instruction_id="inst-u2",
         slug="srv-1",
         kind="update-instance",
+        mode="force",
     )
+    restart_mock.assert_not_called()
+
+
+def test_execute_verified_update_force_waits_for_drain_and_verifies_manifest_artifact():
+    runtime = _runtime()
+
+    with patch.object(runtime, "_manifest_client_expectation", return_value={"client_sha256": "abc", "version": "v1"}) as expectation_mock, patch.object(
+        runtime,
+        "_execute_watchdog_http_action",
+        return_value=(True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/update"}, None),
+    ) as update_mock, patch.object(
+        runtime,
+        "_wait_for_instance_inactive",
+        return_value=(True, {"active": False}),
+    ) as inactive_mock, patch.object(
+        runtime,
+        "_wait_for_instance_active",
+        return_value=(False, {"active": False}),
+    ) as active_mock, patch.object(
+        runtime,
+        "_execute_verified_restart",
+        return_value=(True, {"status_code": 200, "url": "http://127.0.0.1:8000/instances/srv-1/restart"}, None),
+    ) as restart_mock, patch.object(
+        runtime,
+        "_wait_for_manifest_client_artifact",
+        return_value=(True, {"applied": True, "observed_client_sha256": "abc"}),
+    ) as artifact_mock:
+        ok, result, error = runtime._execute_verified_update(
+            instruction_id="inst-u3",
+            slug="srv-1",
+            kind="update-instance",
+            mode="force",
+        )
+
+    assert ok is True
+    assert error is None
+    assert result["forced_restart"]["status_code"] == 200
+    assert result["manifest_apply"]["applied"] is True
+    expectation_mock.assert_called_once_with("srv-1")
+    update_mock.assert_called_once()
+    inactive_mock.assert_called_once()
+    active_mock.assert_called_once()
+    restart_mock.assert_called_once_with(
+        instruction_id="inst-u3",
+        slug="srv-1",
+        kind="update-instance",
+    )
+    artifact_mock.assert_called_once()
+
+
+def test_execute_verified_update_force_fails_when_manifest_artifact_not_applied():
+    runtime = _runtime()
+
+    with patch.object(runtime, "_manifest_client_expectation", return_value={"client_sha256": "abc", "version": "v1"}), patch.object(
+        runtime,
+        "_execute_watchdog_http_action",
+        return_value=(True, {"status_code": 200}, None),
+    ), patch.object(
+        runtime,
+        "_wait_for_instance_inactive",
+        return_value=(False, {"active": True}),
+    ), patch.object(
+        runtime,
+        "_execute_verified_restart",
+        return_value=(True, {"status_code": 200}, None),
+    ), patch.object(
+        runtime,
+        "_wait_for_manifest_client_artifact",
+        return_value=(False, {"applied": False, "observed_client_sha256": "old"}),
+    ):
+        ok, result, error = runtime._execute_verified_update(
+            instruction_id="inst-u4",
+            slug="srv-1",
+            kind="update-instance",
+            mode="force",
+        )
+
+    assert ok is False
+    assert "latest manifest artifact was not applied locally" in str(error)
+    assert result["manifest_apply"]["applied"] is False
 
 
 def test_database_values_ignore_commented_postgres_lines():
