@@ -2761,15 +2761,22 @@ class AgentRuntime:
         slug_norm = str(slug or "").strip().lower()
         repo_text = str(repo or "").strip()
         branch_text = str(branch or "master").strip() or "master"
-        cdn_base = str(cdn_service_url or "").strip().rstrip("/")
+        # Agent is co-located with its CDN — always prefer the local CDN service.
+        # SS14_ROBUST_CDN_SERVICE_INTERNAL_URL overrides (set by IaC for CDN nodes).
+        # cdn_service_url from the provisioner is a fallback only; it may point to the
+        # wrong CDN when the provisioner hosts multiple nodes with different CDNs.
+        cdn_base = (
+            _env("SS14_ROBUST_CDN_SERVICE_INTERNAL_URL")
+            or _env("AGENT_CDN_SERVICE_URL")
+            or str(cdn_service_url or "")
+            or "http://127.0.0.1:13001"
+        ).strip().rstrip("/")
         token = str(api_token or "").strip()
 
         if not slug_norm:
             return False, {}, "slug is required"
         if not repo_text:
             return False, {}, "repo is required"
-        if not cdn_base:
-            return False, {}, "cdn_service_url is required"
         if not token:
             return False, {}, "api_token is required"
 
