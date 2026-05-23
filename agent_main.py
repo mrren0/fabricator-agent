@@ -6784,8 +6784,14 @@ class AgentRuntime:
             )
             if (
                 kind in {"restart-instance", "update-instance", "stop-instance"}
-                and str(error or "").startswith("watchdog request ")
-                and _same_url_target(str((result or {}).get("watchdog_url") or ""), self.local_api_url or _default_local_api_url())
+                and (
+                    str(error or "").startswith("watchdog update/restart completed")
+                    or str(error or "").startswith("watchdog update completed")
+                    or (
+                        str(error or "").startswith("watchdog request ")
+                        and _same_url_target(str((result or {}).get("watchdog_url") or ""), self.local_api_url or _default_local_api_url())
+                    )
+                )
             ):
                 logger.warning(
                     "Instruction id=%s kind=%s slug=%s skipping local API fallback because watchdog and local API targets are the same unreachable endpoint",
