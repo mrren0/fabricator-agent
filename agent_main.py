@@ -2987,6 +2987,43 @@ class AgentRuntime:
             "client_url": str(client.get("url") or "").strip() or None,
         }
 
+    def _manifest_installed_zip_equivalent(
+        self,
+        expectation: dict[str, Any] | None,
+        installed_sha: str,
+    ) -> str | None:
+        """Return the matching build version string if the installed zip SHA matches any
+        build for the same base commit in the manifest, or None if no match."""
+        if not installed_sha or not isinstance(expectation, dict):
+            return None
+        manifest_url = str(expectation.get("manifest_url") or "").strip()
+        expected_version = str(expectation.get("version") or "").strip()
+        if not manifest_url or not expected_version:
+            return None
+        base_commit = expected_version.split("-rebuild-")[0] if "-rebuild-" in expected_version else expected_version
+        if not base_commit:
+            return None
+        try:
+            payload = self._embedded_fetch_manifest_payload(manifest_url)
+        except Exception:
+            return None
+        builds = (payload or {}).get("builds") if isinstance(payload, dict) else None
+        if not isinstance(builds, dict):
+            return None
+        for version, build in builds.items():
+            if not isinstance(build, dict):
+                continue
+            version_str = str(version or "").strip()
+            version_base = version_str.split("-rebuild-")[0] if "-rebuild-" in version_str else version_str
+            if version_base != base_commit:
+                continue
+            client = build.get("client")
+            if not isinstance(client, dict):
+                continue
+            if str(client.get("sha256") or "").strip().lower() == installed_sha:
+                return version_str
+        return None
+
     def _wait_for_manifest_client_artifact(
         self,
         *,
@@ -6351,6 +6388,18 @@ class AgentRuntime:
             )
             result["manifest_apply"] = artifact_meta
             if not artifact_ok:
+                installed_sha = str(artifact_meta.get("observed_client_sha256") or "").strip().lower()
+                equiv = self._manifest_installed_zip_equivalent(expectation, installed_sha)
+                if equiv:
+                    result["manifest_apply"] = dict(artifact_meta)
+                    result["manifest_apply"]["already_on_equivalent_build"] = True
+                    result["manifest_apply"]["equivalent_build"] = equiv
+                    logger.info(
+                        "Instruction slug=%s manifest verification: installed zip matches an equivalent build in manifest (%s) — treating as up to date",
+                        slug,
+                        equiv,
+                    )
+                    return True, result, None
                 return (
                     False,
                     result,
