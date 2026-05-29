@@ -2833,7 +2833,13 @@ class AgentRuntime:
         try:
             if not isinstance(response, requests.Response):
                 return False, {}, "CDN build request failed: no response"
-            response.raise_for_status()
+            if response.status_code >= 400:
+                try:
+                    body = response.json()
+                    detail = str(body.get("detail") or "").strip()
+                except Exception:
+                    detail = str(response.text or "").strip()[:500]
+                return False, {}, f"CDN build request failed: HTTP {response.status_code}: {detail or 'no detail'}"
             data = response.json() if response.content else {}
             payload = dict(data) if isinstance(data, dict) else {"raw": str(data)}
             if build_id_text:
