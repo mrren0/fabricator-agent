@@ -7007,7 +7007,29 @@ class AgentRuntime:
         if not repo or not slug:
             return
         if self._embedded_scan_instance_config_path(slug) is not None:
-            logger.info("Auto-provision skipped: instance '%s' already exists", slug)
+            # Config exists — check if watchdog binary is also present; if not, bootstrap it.
+            _, _, wd_root = self._embedded_watchdog_layout(slug)
+            binary_missing = True
+            try:
+                self._embedded_find_watchdog_command(wd_root)
+                binary_missing = False
+            except RuntimeError:
+                pass
+            if not binary_missing:
+                logger.info("Auto-provision skipped: instance '%s' already exists", slug)
+                return
+            logger.info(
+                "Auto-provision: config exists but watchdog binary missing for '%s', bootstrapping service",
+                slug,
+            )
+            watchdog_service = _env("SS14_WD_SYSTEMD_SERVICE", f"SS14.Watchdog-{slug}") or f"SS14.Watchdog-{slug}"
+            wd_fs_user = _env("SS14_WD_FS_USER") or _env("SS14_WD_USER") or "ss14"
+            wd_fs_group = _env("SS14_WD_FS_GROUP") or _env("SS14_WD_GROUP") or wd_fs_user
+            try:
+                svc = self._embedded_restart_watchdog(watchdog_service, wd_root, wd_fs_user, wd_fs_group)
+                logger.info("Auto-provision bootstrap succeeded slug=%s service=%s", slug, svc)
+            except Exception:
+                logger.exception("Auto-provision bootstrap failed slug=%s", slug)
             return
         logger.info("Auto-provisioning SS14 instance slug=%s repo=%s branch=%s", slug, repo, branch)
         try:
