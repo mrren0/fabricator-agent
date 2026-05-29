@@ -521,6 +521,11 @@ class AgentRuntime:
         self.public_key = _env("AGENT_PUBLIC_KEY")
         self.bootstrap_token = _env("AGENT_BOOTSTRAP_TOKEN")
         self.agent_slug = _env("AGENT_SLUG")
+        self.owner_discord_id = _env("AGENT_OWNER_DISCORD_ID")
+        self.provider_id = _env("AGENT_PROVIDER_ID")
+        self.order_ref = _env("AGENT_ORDER_REF")
+        self.container_ref = _env("AGENT_CONTAINER_REF")
+        self.instance_slug = _env("AGENT_INSTANCE_SLUG")
         self.token_file = Path(_env("AGENT_TOKEN_FILE", "/opt/fabricator-agent/agent.token") or "/opt/fabricator-agent/agent.token")
         self.poll_seconds = int(_env("AGENT_POLL_SECONDS", "10") or "10")
         self.timeout = int(_env("AGENT_HTTP_TIMEOUT_SECONDS", "10") or "10")
@@ -610,6 +615,7 @@ class AgentRuntime:
         self._next_config_sync_at = 0.0
         self._next_watchdog_log_sync_at = 0.0
         self._cycle_seq = 0
+        self._auto_provision_done = False
         self._config_snapshot_hashes: dict[str, str] = {}
         self._watchdog_log_hashes: dict[str, deque[str]] = {}
         self._load_token_file()
@@ -636,6 +642,20 @@ class AgentRuntime:
                 "This can cause remote instruction loops.",
                 local_host,
             )
+
+    def _install_metadata_details(self) -> dict[str, str]:
+        metadata = {
+            "owner_discord_id": self.owner_discord_id,
+            "provider_id": self.provider_id,
+            "order_ref": self.order_ref,
+            "container_ref": self.container_ref,
+            "instance_slug": self.instance_slug,
+        }
+        return {
+            key: str(value or "").strip()
+            for key, value in metadata.items()
+            if str(value or "").strip()
+        }
 
     @staticmethod
     def supported_instruction_kinds() -> list[str]:
@@ -1193,6 +1213,7 @@ class AgentRuntime:
                 "public_ip": self.public_ip or None,
                 "private_ip": self.private_ip or None,
                 "hostname": self.hostname,
+                **self._install_metadata_details(),
             },
         }
         res = requests.post(
@@ -1235,6 +1256,7 @@ class AgentRuntime:
                     "agent_version_base": APP_VERSION,
                     "agent_build": AGENT_BUILD,
                     "agent_installed_at": AGENT_INSTALLED_AT,
+                    **self._install_metadata_details(),
                 },
                 "remote_instances": self._heartbeat_remote_instances_payload(),
                 "relay_url": self.relay_url or None,
@@ -1278,6 +1300,7 @@ class AgentRuntime:
                 "agent_version_base": APP_VERSION,
                 "agent_build": AGENT_BUILD,
                 "agent_installed_at": AGENT_INSTALLED_AT,
+                **self._install_metadata_details(),
             },
         }
         res = requests.post(
@@ -1784,6 +1807,7 @@ class AgentRuntime:
                 "location": self.location,
                 "slug": self.agent_slug,
                 "public_ip": self.public_ip or None,
+                **self._install_metadata_details(),
             },
         }
         headers = {"Content-Type": "application/json"}
@@ -6975,6 +6999,26 @@ class AgentRuntime:
             return False, {"status_code": res.status_code, "response": data}, "local api call failed"
         return False, {}, f"unsupported instruction kind: {kind}"
 
+    def _try_auto_provision(self) -> None:
+        self._auto_provision_done = True
+        repo = str(_env("AGENT_SS14_REPO") or "").strip()
+        branch = str(_env("AGENT_SS14_BRANCH") or "master").strip() or "master"
+        slug = str(self.instance_slug or self.agent_slug or "").strip().lower()
+        if not repo or not slug:
+            return
+        if self._embedded_scan_instance_config_path(slug) is not None:
+            logger.info("Auto-provision skipped: instance '%s' already exists", slug)
+            return
+        logger.info("Auto-provisioning SS14 instance slug=%s repo=%s branch=%s", slug, repo, branch)
+        try:
+            ok, data, error = self._embedded_create_slug({"slug": slug, "repo": repo, "branch": branch})
+            if ok:
+                logger.info("Auto-provision succeeded slug=%s", slug)
+            else:
+                logger.error("Auto-provision failed slug=%s error=%s data=%s", slug, error, data)
+        except Exception:
+            logger.exception("Auto-provision raised an exception slug=%s", slug)
+
     def loop(self) -> None:
         while not self._stop.is_set():
             cycle_error: str | None = None
@@ -7012,6 +7056,8 @@ class AgentRuntime:
                     self._register(cfg, cfg_sha)
                 if self._heartbeat_due():
                     self._heartbeat(cfg_sha)
+                if not self._auto_provision_done and self.agent_token:
+                    self._try_auto_provision()
                 if self._config_sync_due():
                     try:
                         self._sync_config_snapshots()
