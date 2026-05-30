@@ -553,6 +553,7 @@ class AgentRuntime:
         self.local_api_url = _default_local_api_url()
         self._legacy_auth_disabled = False
         self._stop = threading.Event()
+        self._gentle_wait_stash: list[dict[str, Any]] = []
         self._thread: threading.Thread | None = None
         self.status: dict[str, Any] = {
             "registered": False,
@@ -1318,7 +1319,33 @@ class AgentRuntime:
         self.status["last_heartbeat_at"] = time.time()
         logger.info("Legacy heartbeat accepted agent_id=%s", self.agent_id)
 
+    def _relay_peek_nowait(self) -> "dict[str, Any] | None":
+        """Pull one instruction from relay with zero wait. Used to interrupt gentle waits."""
+        if not self.agent_token:
+            return None
+        poll_url_base = self.relay_url or self.backend_url
+        poll_path_prefix = "/relay" if self.relay_url else ""
+        try:
+            res = requests.get(
+                f"{poll_url_base}{poll_path_prefix}/api/agent/runtime/{self.agent_id}/instructions",
+                params={"limit": 1, "wait_seconds": 0},
+                headers=self._runtime_headers(),
+                timeout=5.0,
+            )
+            if res.status_code == 200:
+                data = res.json() if res.content else {}
+                items = data.get("instructions") or []
+                return items[0] if items else None
+        except Exception:
+            pass
+        return None
+
     def _pull(self) -> tuple[list[dict[str, Any]], float]:
+        if self._gentle_wait_stash:
+            stashed = self._gentle_wait_stash[:]
+            self._gentle_wait_stash.clear()
+            logger.info("Returning %s stashed instruction(s) from interrupted gentle wait", len(stashed))
+            return stashed, 0.0
         request_timeout = max(self.timeout, self.instruction_wait_seconds + 15)
         wait_seconds = max(0, int(self.instruction_wait_seconds))
         pull_started_at = time.time()
@@ -6181,7 +6208,44 @@ class AgentRuntime:
                     },
                     f"gentle mode timed out waiting for players to leave: slug={slug_norm} players={players} timeout_seconds={int(round(timeout_seconds))}",
                 )
-            time.sleep(min(poll_seconds, max(0.2, deadline - time.time())))
+            try:
+                check_interval = max(2.0, float(_env("AGENT_GENTLE_INTERRUPT_CHECK_SECONDS", "5") or "5"))
+            except Exception:
+                check_interval = 5.0
+            sleep_total = min(poll_seconds, max(0.2, deadline - time.time()))
+            elapsed_sleep = 0.0
+            while elapsed_sleep < sleep_total:
+                chunk = min(check_interval - (elapsed_sleep % check_interval if elapsed_sleep % check_interval else check_interval), sleep_total - elapsed_sleep)
+                chunk = max(0.2, chunk)
+                time.sleep(chunk)
+                elapsed_sleep += chunk
+                if elapsed_sleep >= check_interval:
+                    interrupt_item = self._relay_peek_nowait()
+                    if interrupt_item is not None:
+                        i_kind = str((interrupt_item.get("kind") or "")).strip().lower()
+                        i_payload = interrupt_item.get("payload") or {}
+                        i_mode = str(i_payload.get("schedule_mode") or "").strip().lower()
+                        i_slug = str(i_payload.get("slug") or "").strip().lower()
+                        is_force = i_mode not in {"", "gentle"}
+                        is_stopper = i_kind in {"stop-instance", "delete-instance"} or (i_kind in {"restart-instance", "update-instance"} and is_force)
+                        self._gentle_wait_stash.append(interrupt_item)
+                        if is_stopper and (not i_slug or i_slug == slug_norm):
+                            logger.warning(
+                                "Instruction id=%s kind=%s slug=%s gentle wait interrupted by %s %s (slug=%s)",
+                                instruction_id, kind, slug_norm, i_kind, i_mode or "force", i_slug or "-",
+                            )
+                            return (
+                                False,
+                                {
+                                    "mode": "gentle",
+                                    "players": players,
+                                    "max_players": self._safe_int(snapshot.get("max_players")),
+                                    "status": str(snapshot.get("status") or "").strip().lower() or ("online" if active else "offline"),
+                                    "waited_seconds": round(max(0.0, time.time() - started_at), 3),
+                                    "interrupted_by": {"kind": i_kind, "mode": i_mode},
+                                },
+                                f"gentle wait interrupted by force operation: {i_kind}",
+                            )
 
     def _wait_for_instance_active(
         self,
